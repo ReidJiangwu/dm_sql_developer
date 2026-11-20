@@ -1,8 +1,10 @@
 # GzydDmTools Community
 
-面向达梦数据库的 Windows x64 工作台与命令行客户端。社区源码保留通用数据库功能，剔除私有业务实现、内部更新服务及原仓库历史。
+面向达梦数据库的桌面工作台与命令行工具。支持 SQL 编辑与执行、数据库对象开发、存储过程调试和脚本批量发布。
 
-[操作手册](shared/help/user-guide.md) · [第三方说明](docs/third-party-notices.md) · [许可证范围](LICENSE-SCOPE.md)
+[下载安装](https://github.com/ReidJiangwu/dm_sql_developer/releases) · [操作手册](shared/help/user-guide.md) · [更新说明](release-notes.json) · [许可证](LICENSE-SCOPE.md)
+
+![达梦工作台预览，从启动页到连接、SQL 编辑和操作日志](shared/help/images/workbench-preview.gif)
 
 ## 下载安装
 
@@ -25,13 +27,7 @@ shasum -a 256 ~/Downloads/GzydDmTools-Community-1.4.49-macos-x64.pkg
 
 如需安装 Rosetta，请按 Apple 的系统提示操作。[Apple 安全打开 App 指南](https://support.apple.com/zh-cn/102445) · [Apple Rosetta 说明](https://support.apple.com/zh-cn/102527)
 
-## 应用截图
-
-以下五张截图取自 2026-11-13 构建的 1.4.49 社区版 Windows 工作台，在独立 Wine 11.0 环境运行，由 Qt 控件直接截取。连接、SQL 和结果均为离线示例。
-
-### 启动页
-
-![社区版启动页](shared/help/images/startup.png)
+## 界面一览
 
 ### 首页工作台
 
@@ -49,7 +45,7 @@ shasum -a 256 ~/Downloads/GzydDmTools-Community-1.4.49-macos-x64.pkg
 
 ![操作日志：SQL、连接名和时间优先展示](shared/help/images/operation-log.png)
 
-## 可以做什么
+## 主要功能
 
 - 管理直连和集群连接，区分应用主连接与各工作窗口的独立会话。
 - 编辑和执行 SQL，查看结果／计划／诊断，按条件编辑数据、导入和导出。
@@ -74,7 +70,7 @@ shasum -a 256 ~/Downloads/GzydDmTools-Community-1.4.49-macos-x64.pkg
 
 本目录不包含数据库 SDK、驱动 DLL、调试器 EXE、Qt／Wine 预编译运行环境、个人配置、客户数据或原 `.git`。界面字体资源附带固定来源、SHA-256 和许可证；它们不被项目自有代码许可替代。
 
-社区版随源码提供 Noto Serif CJK SC。编辑器可使用系统已安装的 MesloLGS NF，或回退到系统等宽字体。历史截图使用当时构建内置的编辑器字体。
+社区版随源码提供 Noto Serif CJK SC。编辑器可使用系统已安装的 MesloLGS NF，或回退到系统等宽字体。
 
 ## 在 Windows 构建
 
@@ -83,7 +79,7 @@ shasum -a 256 ~/Downloads/GzydDmTools-Community-1.4.49-macos-x64.pkg
 使用 x64 且彼此匹配的编译器和库：
 
 - CMake 3.25+ 和 Ninja，或其他与本机 Qt 一致的 CMake 生成器。
-- Qt 6.4 或更高版本，需要 Concurrent、Network、Sql、Widgets 及相应运行插件。历史截图构建使用 Qt 6.8.3。
+- Qt 6.4 或更高版本，需要 Concurrent、Network、Sql、Widgets 及相应运行插件。
 - 从达梦 DM8 开发版取得的 Windows x64 DPI SDK。构建目录应包含 `drivers/dpi/include/DPI.h` 及可链接的 `dmdpi` 库。使用、复制与再分发须遵守达梦适用的软件许可。[达梦开发版下载说明](https://eco.dameng.com/document/dm/zh-cn/faq/faq-dm-product) · [DPI 编程指南](https://eco.dameng.com/document/dm/zh-cn/pm/dpi-rogramming-guide)
 - libsodium 1.0.22，通过 `Sodium_ROOT` 指定。
 - zlib 1.2.13 或更新的兼容版本，提供与编译器匹配的静态库，通过 `ZLIB_ROOT` 指定；用于文件类型探测中的小型 ZIP 成员解压。
@@ -133,9 +129,9 @@ CLI 任务示例中的连接 ID、路径和全零摘要必须替换，不能直�
 
 macOS 安装包通过内置 Wine 运行 Windows 客户端。
 
-## 更新与本次验证状态
+## 更新与许可
 
-当前源码版本为 1.4.49，社区更新见 [更新说明](release-notes.json)。截图展示 2026-11-13 的工作台构建。当前源码快照已检查本地头文件、CMake 输入和 Qt 资源引用，构建、全量回归、Windows 实机和真实数据库验收待验证。
+新版本及下载见 [GitHub Releases](https://github.com/ReidJiangwu/dm_sql_developer/releases)，完整变更见 [更新说明](release-notes.json)。
 
 自有代码采用 Apache-2.0 许可证，第三方资源沿用各自的许可。详见 [许可证范围](LICENSE-SCOPE.md) 和 [第三方说明](docs/third-party-notices.md)。
 

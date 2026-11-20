@@ -14511,7 +14511,8 @@ bool MainWindow::hasUsableLayout() const {
             && qApp->styleSheet().contains(
                 QStringLiteral("QPushButton[menuButton=\"true\"]::menu-indicator")))
         && report(QStringLiteral("globalFormControlStyleExists"),
-            qApp->styleSheet().contains(QStringLiteral("QAbstractSpinBox"))
+            qApp->styleSheet().contains(QStringLiteral("QSpinBox::up-arrow"))
+            && qApp->styleSheet().contains(QStringLiteral("QDoubleSpinBox::down-arrow"))
             && qApp->styleSheet().contains(QStringLiteral("QCheckBox"))
             && qApp->styleSheet().contains(QStringLiteral("QProgressBar::chunk"))
             && qApp->styleSheet().contains(QStringLiteral("QToolTip"))
