@@ -63,7 +63,7 @@
 
 - CMake 3.25+ 和 Ninja，或其他与本机 Qt 一致的 CMake 生成器。
 - Qt 6.4 或更高版本，需要 Concurrent、Network、Sql、Widgets 及相应运行插件。历史截图构建使用 Qt 6.8.3。
-- 自行合法取得的达梦 DPI SDK，目录中应包含 `drivers/dpi/include/DPI.h` 及可链接的 `dmdpi` 库。
+- 从达梦 DM8 开发版取得的 Windows x64 DPI SDK。构建目录应包含 `drivers/dpi/include/DPI.h` 及可链接的 `dmdpi` 库。使用、复制与再分发须遵守达梦适用的软件许可。[达梦开发版下载说明](https://eco.dameng.com/document/dm/zh-cn/faq/faq-dm-product) · [DPI 编程指南](https://eco.dameng.com/document/dm/zh-cn/pm/dpi-rogramming-guide)
 - libsodium 1.0.22，通过 `Sodium_ROOT` 指定。
 - zlib 1.2.13 或更新的兼容版本，提供与编译器匹配的静态库，通过 `ZLIB_ROOT` 指定；用于文件类型探测中的小型 ZIP 成员解压。
 - QtKeychain 由 CMake 固定到特定提交，首次配置需要访问上游；离线构建可通过 CMake 的 FetchContent 源目录配置提供同一版本。

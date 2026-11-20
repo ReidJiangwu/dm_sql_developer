@@ -20,7 +20,7 @@
 
 ## 供应商文件
 
-达梦 DPI 和 dmdbg 由使用者依其取得的许可自行提供。发布含供应商文件的安装包前，需要核对供应商二进制的再分发权利。
+项目构建使用来自达梦 DM8 开发版的 Windows x64 DPI SDK 和运行库。DPI 头文件、库文件和 dmdbg 调试器适用达梦的软件许可。使用、复制和再分发这些组件时，应遵守所取得版本的许可条款，并由使用者通过达梦官方渠道取得所需组件。随安装包公开再分发前，应确认达梦许可覆盖该分发方式。[达梦开发版下载说明](https://eco.dameng.com/document/dm/zh-cn/faq/faq-dm-product) · [DPI 编程指南](https://eco.dameng.com/document/dm/zh-cn/pm/dpi-rogramming-guide)
 
 Qt、QtKeychain、libsodium 和 Tree-sitter 等已有开放许可的依赖，通常按相应条款使用与分发即可，并非全部都要另向作者申请书面许可；这不豁免保留版权、许可文本和其他条款义务。
 
