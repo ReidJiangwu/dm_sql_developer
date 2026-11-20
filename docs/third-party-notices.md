@@ -4,11 +4,11 @@
 
 | 依赖 | 本地证据／版本 | 当前处理 |
 |---|---|---|
-| Qt | 最低 6.4，当前内部 6.8.3；所用开放许可须逐模块核对 | 社区源码不附 Qt 二进制；分发安装包时落实 LGPLv3 等相应条件，不能只附项目 Apache 许可证 |
+| Qt | 安装包使用 6.8.3 | Qt DLL 和插件动态链接。安装包附带 Qt 许可与对应源码获取说明。[Qt 6.8.3 对应源码](https://download.qt.io/archive/qt/6.8/6.8.3/single/) |
 | QtKeychain | 固定提交 875f77d9f61bd97fd84cca47ce3bc71186dfbd09，Modified BSD／BSD-3-Clause | 不导出依赖源码副本；许可全文见 `licenses/third-party/qtkeychain-BSD-3-Clause.txt`；上游源码含 Frank Osterfeld 的版权声明，二进制分发时保留相关声明 |
 | libsodium | 固定 1.0.22，ISC | 不导出预编译库；许可全文见 `licenses/third-party/libsodium-ISC.txt` |
 | zlib | 本地 MinGW 工具链 1.2.13，zlib License | CMake 静态链接 `ZLIB::ZLIB`；不导出预编译库，保留 `licenses/third-party/zlib.txt` |
-| 达梦 DPI／dmdbg | 使用者提供 SDK／调试器 | 不导出供应商文件，安装包再分发待确认 |
+| 达梦 DPI／dmdbg | 达梦 DM8 开发版 Windows x64 组件 | 源码仓库不存放供应商二进制。安装包所附运行组件适用达梦原许可 |
 | Wine、旧版 Noto Sans 中文回退字体及 Lobby 素材 | 内部打包输入或私有资源 | 原有隔离边界保持不变 |
 | Noto Serif CJK SC | 官方 noto-cjk 固定提交 f8d157532fbfaeda587e826d4cd5b21a49186f7c；SIL OFL 1.1 | 应用界面宋体风格；字体、许可与哈希位于 `clients/qt/resources/fonts/`，通过资源加载，不安装系统字体 |
 | MesloLGS NF | [Powerlevel10k 字体来源](https://github.com/romkatv/powerlevel10k/blob/master/font.md) | 社区源码不附带此字体。编辑器可使用系统已安装的 MesloLGS NF，或回退到系统等宽字体 |
@@ -20,7 +20,7 @@
 
 ## 供应商文件
 
-项目构建使用来自达梦 DM8 开发版的 Windows x64 DPI SDK 和运行库。DPI 头文件、库文件和 dmdbg 调试器适用达梦的软件许可。使用、复制和再分发这些组件时，应遵守所取得版本的许可条款，并由使用者通过达梦官方渠道取得所需组件。随安装包公开再分发前，应确认达梦许可覆盖该分发方式。[达梦开发版下载说明](https://eco.dameng.com/document/dm/zh-cn/faq/faq-dm-product) · [DPI 编程指南](https://eco.dameng.com/document/dm/zh-cn/pm/dpi-rogramming-guide)
+项目构建使用来自达梦 DM8 开发版的 Windows x64 DPI SDK。安装包附带 DPI 运行库和 dmdbg 调试器。使用、复制和再分发这些组件时，须遵守达梦适用的软件许可。自行构建请通过达梦官方渠道取得 SDK。[达梦开发版下载说明](https://eco.dameng.com/document/dm/zh-cn/faq/faq-dm-product) · [DPI 编程指南](https://eco.dameng.com/document/dm/zh-cn/pm/dpi-rogramming-guide)
 
 Qt、QtKeychain、libsodium 和 Tree-sitter 等已有开放许可的依赖，通常按相应条款使用与分发即可，并非全部都要另向作者申请书面许可；这不豁免保留版权、许可文本和其他条款义务。
 

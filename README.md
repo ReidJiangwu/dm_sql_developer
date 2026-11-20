@@ -4,6 +4,27 @@
 
 [操作手册](shared/help/user-guide.md) · [第三方说明](docs/third-party-notices.md) · [许可证范围](LICENSE-SCOPE.md)
 
+## 下载安装
+
+在 [GitHub Releases](https://github.com/ReidJiangwu/dm_sql_developer/releases) 下载对应平台的社区版安装包，对照发布页的 SHA-256 核验下载文件。安装包随附达梦 DM8 开发版 DPI 运行库和调试器组件，使用这些组件须遵守达梦适用许可。
+
+- **Windows x64**：运行 `GzydDmTools-Community-1.4.49-windows-x64-setup.exe`，按向导安装。
+- **macOS**：打开 `GzydDmTools-Community-1.4.49-macos-x64.pkg`，按系统安装器提示操作。安装包内含 Wine。Apple 芯片 Mac 需要 Rosetta 2。
+
+### macOS 首次安装信任
+
+此 PKG 未使用 Developer ID 签名，也未提交 Apple 公证。只从本项目的 GitHub Releases 下载，并用以下命令核对 SHA-256。若摘要与发布页不同，停止安装。
+
+```bash
+shasum -a 256 ~/Downloads/GzydDmTools-Community-1.4.49-macos-x64.pkg
+```
+
+1. 在 Finder 中双击 PKG。若 macOS 提示无法验证开发者，先关闭提示。
+2. 打开「系统设置 → 隐私与安全性」，在「安全性」中找到本次被拦截的项目，选择「仍要打开」并确认。
+3. 在系统安装器中完成安装，再从「应用程序」打开小智达梦管理工具。如设备由单位管理且未提供「仍要打开」，联系设备管理员。
+
+如需安装 Rosetta，请按 Apple 的系统提示操作。[Apple 安全打开 App 指南](https://support.apple.com/zh-cn/102445) · [Apple Rosetta 说明](https://support.apple.com/zh-cn/102527)
+
 ## 应用截图
 
 以下五张截图取自 2026-11-13 构建的 1.4.49 社区版 Windows 工作台，在独立 Wine 11.0 环境运行，由 Qt 控件直接截取。连接、SQL 和结果均为离线示例。
@@ -110,7 +131,7 @@ ctest --test-dir build/qt --output-on-failure
 
 CLI 任务示例中的连接 ID、路径和全零摘要必须替换，不能直接发布。社区版不接受私有业务会话初始化。
 
-macOS 采用 Windows 运行目录加 Wine 的路线，本目录没有可直接安装的 Mac 包或原生 macOS 客户端；需要自行准备并验证运行环境。
+macOS 安装包通过内置 Wine 运行 Windows 客户端。
 
 ## 更新与本次验证状态
 
