@@ -1,0 +1,65 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local database SDKs and proprietary drivers
+drivers/
+libs/local/
+
+# Build outputs
+build/
+out/
+target/
+dist/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# Retained local compiler caches
+.gradle/
+.gradle-codex/
+*.class
+
+# Node tooling
+node_modules/
+language-server/grammar/.tree-sitter-local/
+language-server/grammar/tree-sitter
+
+# Qt and CMake user state
+*.user
+*.user.*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+/reid_test.cpp
+/tmp_*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.settings/
+.classpath
+.project
+.DS_Store
+Thumbs.db
+
+# AI tool local state
+.agents/
+.codex/
+.claude/
+.ecc/
+
+# Local Resource Hub credentials
+/gzyd-dm-tools-integration-with-keys.md

@@ -1,0 +1,10 @@
+#pragma once
+
+#include <array>
+
+namespace reid::update::detail {
+
+inline constexpr std::array<unsigned char, @REID_DOWNLOAD_KEY_SIZE@>
+    kEncodedDownloadKey{@REID_DOWNLOAD_KEY_BYTES@};
+
+} // namespace reid::update::detail

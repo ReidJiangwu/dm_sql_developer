@@ -1,0 +1,47 @@
+{
+  "data": "offline-fixtures",
+  "edition": "community",
+  "images": [
+    {
+      "file": "startup.png",
+      "height": 400,
+      "sha256": "ed60d907a078fd2dd43756fb729715fdfb1845e7cd7235e61d8d1fe69ab08860",
+      "title": "启动页",
+      "width": 680
+    },
+    {
+      "file": "home.png",
+      "height": 800,
+      "sha256": "501066436272926e8fec6f5714c1253a7131f409bf061525b055b03850e7fbe2",
+      "title": "首页工作台",
+      "width": 1280
+    },
+    {
+      "file": "connections.png",
+      "height": 700,
+      "sha256": "49496cab1ce3a73ef92860fa24fce4a544b2268b02fa53d7ea08a7029ab42a7b",
+      "title": "连接管理",
+      "width": 1000
+    },
+    {
+      "file": "sql-results.png",
+      "height": 740,
+      "sha256": "19715055beed95f720f3fc4fa17be0157b26dc18eb0a84e0ffd8a7dd68ea7144",
+      "title": "SQL 编辑与结果",
+      "width": 1120
+    },
+    {
+      "file": "operation-log.png",
+      "height": 740,
+      "sha256": "d6ddda1843e2592d559ae62b160f981b4d3ebee8281ccd93a7e487fd2c309425",
+      "title": "操作日志",
+      "width": 1120
+    }
+  ],
+  "renderer": "windows",
+  "version": "1.4.49",
+  "runtime": "Wine 11.0",
+  "captureMethod": "QWidget::grab",
+  "databaseConnected": false,
+  "capturedOn": "2026-11-13"
+}

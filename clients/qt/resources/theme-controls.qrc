@@ -1,0 +1,18 @@
+<RCC><qresource prefix="/theme">
+  <file alias="check-dark.svg">theme/check-dark.svg</file>
+  <file alias="check-light.svg">theme/check-light.svg</file>
+  <file alias="chevron-dark-disabled.svg">theme/chevron-dark-disabled.svg</file>
+  <file alias="chevron-dark.svg">theme/chevron-dark.svg</file>
+  <file alias="chevron-light-disabled.svg">theme/chevron-light-disabled.svg</file>
+  <file alias="chevron-light.svg">theme/chevron-light.svg</file>
+  <file alias="chevron-up-dark-disabled.svg">theme/chevron-up-dark-disabled.svg</file>
+  <file alias="chevron-up-dark.svg">theme/chevron-up-dark.svg</file>
+  <file alias="chevron-up-light-disabled.svg">theme/chevron-up-light-disabled.svg</file>
+  <file alias="chevron-up-light.svg">theme/chevron-up-light.svg</file>
+  <file alias="mixed-dark.svg">theme/mixed-dark.svg</file>
+  <file alias="mixed-light.svg">theme/mixed-light.svg</file>
+</qresource><qresource prefix="/fonts">
+  <file alias="NotoSerifCJKsc-Regular.otf">fonts/NotoSerifCJKsc-Regular.otf</file>
+  <file alias="NotoSerif-LICENSE.txt">fonts/NotoSerif-LICENSE.txt</file>
+  <file alias="sources.json">fonts/sources.json</file>
+</qresource></RCC>

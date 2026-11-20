@@ -1,0 +1,20 @@
+[package]
+name = "GzydDmToolsLanguageServer"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "reid_dm_language_server"
+
+[dependencies]
+lsp-server.workspace = true
+lsp-types.workspace = true
+ropey.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tree-sitter.workspace = true
+tree-sitter-dm-sql = { path = "../grammar" }
+

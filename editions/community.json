@@ -1,0 +1,5 @@
+{
+  "edition": "community",
+  "features": { "erp": false, "internalHub": false },
+  "publicDistribution": true
+}

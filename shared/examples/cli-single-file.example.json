@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "connection_id": "fictional-connection-id",
+  "schema": "APP_TEST",
+  "expected_database_identity": {
+    "identity": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "files": [
+    {
+      "path": "C:/fictional-tasks/DemoApi.svc",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "referenced_files": [],
+  "expected_objects": [
+    {
+      "owner": "APP_TEST",
+      "name": "DEMO_API",
+      "type": "PACKAGE"
+    },
+    {
+      "owner": "APP_TEST",
+      "name": "DEMO_API",
+      "type": "PACKAGE BODY"
+    }
+  ],
+  "execution": {
+    "parallelism": 5,
+    "stop_on_error": false,
+    "compile_expected_objects": true
+  }
+}

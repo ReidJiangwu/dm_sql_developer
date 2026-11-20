@@ -1,0 +1,30 @@
+{
+  "grammars": [
+    {
+      "name": "dm_sql",
+      "camelcase": "DmSql",
+      "scope": "source.dm_sql",
+      "path": ".",
+      "file-types": ["sql", "dmsql"],
+      "highlights": "queries/highlights.scm"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "UNLICENSED",
+    "description": "DM8 SQL and DMSQL grammar",
+    "authors": [
+      {
+        "name": "GzydDmTools"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/ReidDmTools/ReidDmTools"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "rust": true
+  }
+}
+
