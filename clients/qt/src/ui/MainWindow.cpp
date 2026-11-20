@@ -14128,10 +14128,9 @@ bool MainWindow::hasUsableLayout() const {
         && report(QStringLiteral("executionTabAnimationFramesReady"),
             executionAnimationFramesReady)
         && report(QStringLiteral("navigationAndSnippetDocks"), navigationAndSnippetDocks)
-        && report(QStringLiteral("lobbyDesignerMenuEntries"), [this]{
-            const auto* menu=findChild<QMenu*>(QStringLiteral("lobbyManagementMenu"));if(!menu)return false;
-            QStringList labels;for(auto* action:menu->actions())if(!action->isSeparator())labels.append(action->text());
-            return labels==QStringList{QStringLiteral("大厅概览"),QStringLiteral("元素设计器"),QStringLiteral("数据源设计器")};
+        && report(QStringLiteral("lobbyDesignerMenuEntries"), [this] {
+            const auto* menu = findChild<QMenu*>(QStringLiteral("lobbyManagementMenu"));
+            return menu == nullptr;
         }())
         && report(QStringLiteral("navigationDockVisible"),
             navigationDock_ != nullptr && navigationDock_->isVisible())
