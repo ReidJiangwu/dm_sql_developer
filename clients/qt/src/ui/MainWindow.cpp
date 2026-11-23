@@ -4183,6 +4183,8 @@ void MainWindow::createActionsAndMenus() {
                 "达梦 DM8 跨平台客户端<br>"
                 "版本 %1<br><br>"
                 "开发者：Reid<br>"
+                "邮箱：<a href=\"mailto:FreeReid90@Gmail.com\">FreeReid90@Gmail.com</a>"
+                "<br>问题反馈：<a href=\"https://github.com/ReidJiangwu/dm_sql_developer/issues\">GitHub Issues</a>"
                 "<br><br>可在版本说明中查询各版本功能。")
                 .arg(QCoreApplication::applicationVersion()));
         if (QLabel* information = about.findChild<QLabel*>(
