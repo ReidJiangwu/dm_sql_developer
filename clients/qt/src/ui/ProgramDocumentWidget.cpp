@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <utility>
 #include "CommandButton.h"
 #include "SearchField.h"
 #include "InterfaceIcons.h"
@@ -37,6 +39,7 @@
 #include <QSaveFile>
 #include <QScrollBar>
 #include <QSettings>
+#include <QFileInfo>
 #include <QShortcut>
 #include <QSizePolicy>
 #include <QStandardPaths>
@@ -942,6 +945,11 @@ ProgramDocumentWidget::ProgramDocumentWidget(ObjectKey key, QWidget* parent)
         menu.exec(errors_->viewport()->mapToGlobal(point));
     });
     draftTimer_ = new QTimer(this);
+    cursorSaveTimer_ = new QTimer(this);
+    cursorSaveTimer_->setObjectName(QStringLiteral("programCursorSaveTimer"));
+    cursorSaveTimer_->setSingleShot(true);
+    cursorSaveTimer_->setInterval(500);
+    connect(cursorSaveTimer_, &QTimer::timeout, this, &ProgramDocumentWidget::flushCursorState);
     draftTimer_->setSingleShot(true);
     draftTimer_->setInterval(500);
     connect(draftTimer_, &QTimer::timeout, this, &ProgramDocumentWidget::saveCurrentDraft);
@@ -962,7 +970,7 @@ ProgramDocumentWidget::ProgramDocumentWidget(ObjectKey key, QWidget* parent)
                 return;
             }
             symbolRequestsInFlight_.remove(editor);
-            rebuildMembers();
+            queueMemberUpdate(editor);
         });
     connect(LanguageServerClient::instance(), &LanguageServerClient::documentSymbolsFailed,
         this, [this](SqlEditor* editor, const QString& error, qint64) {
@@ -976,7 +984,7 @@ ProgramDocumentWidget::ProgramDocumentWidget(ObjectKey key, QWidget* parent)
                 return;
             }
             symbolRequestsInFlight_.remove(editor);
-            rebuildMembers();
+            queueMemberUpdate(editor);
         });
     connect(LanguageServerClient::instance(), &LanguageServerClient::programDiffReady,
         this, [this](qint64 requestId, const QString& unified, const QString& merged,
@@ -1074,10 +1082,10 @@ ProgramDocumentWidget::ProgramDocumentWidget(ObjectKey key, QWidget* parent)
     const auto saveCursor = [this](SqlEditor* editor, const ObjectKey& key) {
         if (applyingSource_) return;
         const QTextCursor cursor = editor->textCursor();
-        QSettings settings;
         const QString base = editorStateKey(key);
-        settings.setValue(base + QStringLiteral("/line"), cursor.blockNumber());
-        settings.setValue(base + QStringLiteral("/column"), cursor.positionInBlock());
+        pendingCursorState_.insert(base + QStringLiteral("/line"), cursor.blockNumber());
+        pendingCursorState_.insert(base + QStringLiteral("/column"), cursor.positionInBlock());
+        cursorSaveTimer_->start();
     };
     connect(specification_, &QPlainTextEdit::cursorPositionChanged, this,
         [this, saveCursor]() { saveCursor(specification_, key_); });
@@ -1101,6 +1109,21 @@ ProgramDocumentWidget::ProgramDocumentWidget(ObjectKey key, QWidget* parent)
     }
 }
 
+ProgramDocumentWidget::~ProgramDocumentWidget() {
+    flushCursorState();
+}
+
+void ProgramDocumentWidget::flushCursorState() {
+    if (cursorSaveTimer_) cursorSaveTimer_->stop();
+    if (pendingCursorState_.isEmpty()) return;
+    QSettings settings;
+    for (auto it = pendingCursorState_.cbegin(); it != pendingCursorState_.cend(); ++it) {
+        if (!settings.contains(it.key()) || settings.value(it.key()) != it.value())
+            settings.setValue(it.key(), it.value());
+    }
+    pendingCursorState_.clear();
+}
+
 void ProgramDocumentWidget::requestPendingSymbols() {
     const QSet<SqlEditor*> editors = pendingSymbolEditors_;
     pendingSymbolEditors_.clear();
@@ -1113,6 +1136,7 @@ void ProgramDocumentWidget::requestPendingSymbols() {
             continue;
         }
         symbolRequestsInFlight_.remove(editor);
+        queueMemberUpdate(editor);
         if (editor == specification_) {
             specificationSymbols_.clear();
             specificationSymbolError_ = QStringLiteral("语言服务暂不可用");
@@ -1121,10 +1145,28 @@ void ProgramDocumentWidget::requestPendingSymbols() {
             bodySymbolError_ = QStringLiteral("语言服务暂不可用");
         }
     }
-    if (!editors.isEmpty()) rebuildMembers();
+    if (!symbolRequestsInFlight_.isEmpty() && memberCount_)
+        memberCount_->setText(QStringLiteral("正在解析成员…"));
 }
 
 void ProgramDocumentWidget::rebuildMembers() {
+    refreshMemberRows(true, true);
+}
+
+void ProgramDocumentWidget::queueMemberUpdate(SqlEditor* editor) {
+    if (!dirtyMemberEditors_.isEmpty()) {
+        dirtyMemberEditors_.insert(editor);
+        return;
+    }
+    dirtyMemberEditors_.insert(editor);
+    QTimer::singleShot(0, this, [this] {
+        const auto dirty = std::exchange(dirtyMemberEditors_, {});
+        refreshMemberRows(dirty.contains(specification_), dirty.contains(body_));
+
+    });
+}
+
+void ProgramDocumentWidget::refreshMemberRows(bool specChanged, bool bodyChanged) {
     const int selectedSource = memberSourceFilter_ == nullptr
         ? 0 : memberSourceFilter_->currentIndex();
     const QString probe = memberFilter_ == nullptr
@@ -1134,7 +1176,13 @@ void ProgramDocumentWidget::rebuildMembers() {
     const auto sortOrder = memberSort_ == nullptr ? Qt::AscendingOrder
         : static_cast<Qt::SortOrder>(memberSort_->currentData(kMemberSortOrderRole).toInt());
     outline_->setSortingEnabled(false);
-    outline_->clear();
+    if (specChanged && bodyChanged) outline_->clear();
+    else {
+        for (int i = outline_->topLevelItemCount() - 1; i >= 0; --i) {
+            const bool isBody = outline_->topLevelItem(i)->data(0, Qt::UserRole + 2).toInt() == 1;
+            if (isBody ? bodyChanged : specChanged) delete outline_->takeTopLevelItem(i);
+        }
+    }
 
     const auto appendUnit = [this, selectedSource, &probe](
                                 const QVector<CodeSymbol>& sourceSymbols,
@@ -1226,19 +1274,23 @@ void ProgramDocumentWidget::rebuildMembers() {
         }
     };
 
-    appendUnit(specificationSymbols_, key_.type == DatabaseObjectType::Package
+    if (specChanged) appendUnit(specificationSymbols_, key_.type == DatabaseObjectType::Package
             ? QStringLiteral("SPECIFICATION") : QStringLiteral("SOURCE"), 0);
-    if (body_ != nullptr) {
+    if (bodyChanged && body_ != nullptr) {
         appendUnit(bodySymbols_, QStringLiteral("BODY"), 1);
     }
 
-    const int memberCount = outline_->topLevelItemCount();
+    int memberCount = 0;
+    for (int i = 0; i < outline_->topLevelItemCount(); ++i)
+        if (!outline_->topLevelItem(i)->isDisabled()) ++memberCount;
     const auto appendError = [this, selectedSource](
                                  const QString& message, const QString& sourceUnit) {
         const int sourceFilter = sourceUnit == QStringLiteral("SPECIFICATION") ? 1 : 2;
         if (message.isEmpty() || (selectedSource != 0 && selectedSource != sourceFilter)) return;
         auto* item = new ProgramMemberItem(outline_);
+        item->setData(0, Qt::UserRole + 2, sourceUnit == QStringLiteral("BODY") ? 1 : 0);
         item->setText(0, message);
+        item->setToolTip(0, message);
         item->setText(2, sourceUnitText(sourceUnit));
         item->setDisabled(true);
         const QString key = QStringLiteral("99|") + sourceUnit;
@@ -1246,8 +1298,8 @@ void ProgramDocumentWidget::rebuildMembers() {
             item->setData(column, kMemberSortRole, key);
         }
     };
-    appendError(specificationSymbolError_, QStringLiteral("SPECIFICATION"));
-    appendError(bodySymbolError_, QStringLiteral("BODY"));
+    if (specChanged) appendError(specificationSymbolError_, QStringLiteral("SPECIFICATION"));
+    if (bodyChanged) appendError(bodySymbolError_, QStringLiteral("BODY"));
 
     outline_->setSortingEnabled(true);
     outline_->sortItems(sortColumn, sortOrder);
@@ -1505,6 +1557,8 @@ void ProgramDocumentWidget::setLoading(const ObjectKey& value) {
 }
 
 void ProgramDocumentWidget::applySource(const ProgramSource& source) {
+    // Commit the previous position before restore/load reads or replaces it.
+    flushCursorState();
     SqlEditor* editor = editorFor(source.key);
     // Read the location before setPlainText resets the cursor and emits signals.
     const bool wasLoaded = loadedSourceEditors_.contains(editor);
@@ -1834,11 +1888,12 @@ bool ProgramDocumentWidget::applyCompileResult(const ProgramCompileResult& resul
 
 void ProgramDocumentWidget::appendCompileResult(const ProgramCompileResult& result) {
     const SqlEditor* editor = editorFor(result.key);
+    const QString currentFingerprint = sourceFingerprint(editor->toPlainText());
     const QString fingerprint = result.submittedSourceFingerprint.isEmpty()
-        ? sourceFingerprint(editor->toPlainText()) : result.submittedSourceFingerprint;
+        ? currentFingerprint : result.submittedSourceFingerprint;
     const quint64 version = result.submittedSourceFingerprint.isEmpty()
         ? documentVersionFor(result.key) : result.documentVersion;
-    const bool currentVersion = fingerprint == sourceFingerprint(editor->toPlainText())
+    const bool currentVersion = fingerprint == currentFingerprint
         && version == documentVersionFor(result.key);
     const auto appendRow = [this, &result, &fingerprint, version](const ObjectKey& target,
                                const QString& outcome, int code, int line,
@@ -1898,6 +1953,7 @@ void ProgramDocumentWidget::appendCompileResult(const ProgramCompileResult& resu
         return;
     }
 
+    QHash<const SqlEditor*, bool> matchesBaseline;
     int firstErrorRow = -1;
     for (const ProgramDiagnostic& diagnostic : result.diagnostics) {
         ObjectKey target = result.key;
@@ -1908,9 +1964,18 @@ void ProgramDocumentWidget::appendCompileResult(const ProgramCompileResult& resu
                 target.type = DatabaseObjectType::Package;
             }
         }
-        const bool targetCurrent = target == result.key
-            || (!serverFingerprintFor(target).isEmpty()
-                && serverFingerprintFor(target) == sourceFingerprint(editorFor(target)->toPlainText()));
+        bool targetCurrent = target == result.key;
+        if (!targetCurrent) {
+            const auto* other = editorFor(target);
+            auto cached = matchesBaseline.constFind(other);
+            if (cached == matchesBaseline.cend()) {
+                const QString baseline = serverFingerprintFor(target);
+                targetCurrent = !baseline.isEmpty() && baseline == sourceFingerprint(other->toPlainText());
+                matchesBaseline.insert(other, targetCurrent);
+            } else {
+                targetCurrent = cached.value();
+            }
+        }
         const QString outcome = diagnostic.severity == QStringLiteral("警告")
             || diagnostic.severity.compare(
                 QStringLiteral("WARNING"), Qt::CaseInsensitive) == 0
@@ -2108,13 +2173,27 @@ void ProgramDocumentWidget::navigateToLocation(
 void ProgramDocumentWidget::updateState() {
     const ObjectKey target = currentKey();
     SqlEditor* editor = editorFor(target);
-    compile_->setEnabled(!busy_ && !specification_->isReadOnly()
-        && !specification_->toPlainText().trimmed().isEmpty());
-    compileBody_->setEnabled(!busy_ && body_ != nullptr && !body_->isReadOnly()
-        && !body_->toPlainText().trimmed().isEmpty());
-    compileAll_->setEnabled(!busy_ && body_ != nullptr && !specification_->isReadOnly()
-        && !body_->isReadOnly() && !specification_->toPlainText().trimmed().isEmpty()
-        && !body_->toPlainText().trimmed().isEmpty());
+    const auto canCompile = [this](SqlEditor* unit) {
+        if (busy_ || !unit || unit->isReadOnly()) return false;
+        const int revision = unit->document()->revision();
+        auto cached = nonBlankSource_.constFind(unit);
+        if (cached != nonBlankSource_.cend() && cached->first == revision) return cached->second;
+        bool nonBlank = false;
+        for (auto block = unit->document()->begin(); block.isValid(); block = block.next()) {
+            const QString text = block.text();
+            if (std::any_of(text.cbegin(), text.cend(), [](QChar ch) { return !ch.isSpace(); })) {
+                nonBlank = true;
+                break;
+            }
+        }
+        nonBlankSource_.insert(unit, qMakePair(revision, nonBlank));
+        return nonBlank;
+    };
+    const bool specEnabled = canCompile(specification_);
+    const bool bodyEnabled = canCompile(body_);
+    compile_->setEnabled(specEnabled);
+    compileBody_->setEnabled(bodyEnabled);
+    compileAll_->setEnabled(specEnabled && bodyEnabled);
     if (busy_) {
         setActivityState(QStringLiteral("编译中"));
     } else if (editor->isReadOnly()) {
@@ -2128,24 +2207,25 @@ void ProgramDocumentWidget::updateState() {
 void ProgramDocumentWidget::saveCurrentDraft() {
     const auto save = [this](SqlEditor* editor, const ObjectKey& key) {
         if (editor == nullptr || !editor->document()->isModified()) return;
-        QSaveFile file(draftPath(key));
-        const QByteArray content = editor->toPlainText().toUtf8();
-        if (file.open(QIODevice::WriteOnly)
-                && file.write(content) == content.size()) {
-            file.commit();
+        const QString path = draftPath(key);
+        const QString fingerprint = serverFingerprintFor(key);
+        const QString basePath = draftBaseSourcePath(key);
+        const QString stampPath = draftFingerprintPath(key);
+        const bool baseChanged = !draftBaselines_.contains(editor)
+            || draftBaselines_.value(editor) != fingerprint
+            || !QFileInfo::exists(basePath) || !QFileInfo::exists(stampPath);
+        const auto version = documentVersionFor(key);
+        if (!baseChanged && savedDraftVersions_.contains(editor)
+                && savedDraftVersions_.value(editor) == version && QFileInfo::exists(path)) return;
+        const auto write = [](const QString& name, const QByteArray& bytes) {
+            QSaveFile file(name);
+            return file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size() && file.commit();
+        };
+        if (baseChanged) {
+            if (!write(basePath, serverSourceFor(key).toUtf8()) || !write(stampPath, fingerprint.toUtf8())) return;
+            draftBaselines_.insert(editor, fingerprint);
         }
-        QSaveFile fingerprintFile(draftFingerprintPath(key));
-        const QByteArray fingerprint = serverFingerprintFor(key).toUtf8();
-        if (fingerprintFile.open(QIODevice::WriteOnly)
-                && fingerprintFile.write(fingerprint) == fingerprint.size()) {
-            fingerprintFile.commit();
-        }
-        QSaveFile baseSourceFile(draftBaseSourcePath(key));
-        const QByteArray baseSource = serverSourceFor(key).toUtf8();
-        if (baseSourceFile.open(QIODevice::WriteOnly)
-                && baseSourceFile.write(baseSource) == baseSource.size()) {
-            baseSourceFile.commit();
-        }
+        if (write(path, editor->toPlainText().toUtf8())) savedDraftVersions_.insert(editor, version);
     };
     save(specification_, key_);
     if (body_ != nullptr) {

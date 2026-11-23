@@ -5,6 +5,7 @@
 #include "ConnectionProfileTree.h"
 #include "ConnectionExport.h"
 #include "../core/AppPaths.h"
+#include "../core/SettingsSnapshot.h"
 #include "MessagePrompt.h"
 #include "StartupSplash.h"
 #include <QWidgetAction>
@@ -52,7 +53,6 @@
 #include "TestDocumentWidget.h"
 #include "TestDataDialog.h"
 #include "Theme.h"
-#include "UpdateDialog.h"
 #include "VersionNotesDialog.h"
 #include "KeywordReferenceDialog.h"
 #include "OperationLogPanel.h"
@@ -64,7 +64,6 @@
 #include "../data/ObjectDropPlan.h"
 #include "../data/DpiSession.h"
 #include "../core/ConnectionStore.h"
-#include "../core/UpdateInstallerLauncher.h"
 #include "../security/CredentialStore.h"
 #include "../data/MetadataSnapshotStore.h"
 
@@ -710,6 +709,7 @@ MainWindow::MainWindow(
     setTabPosition(Qt::RightDockWidgetArea, QTabWidget::North);
 
     createCentralWorkspace();
+
     if (persistUserState_)
         navigationViews_ = QSettings().value(QStringLiteral("workspace/navigationViews")).toMap();
     createDockWidgets();
@@ -759,7 +759,6 @@ MainWindow::MainWindow(
         applyNavigationView();
         QTimer::singleShot(0, this, [this]() {
             offerAbnormalWorkspaceRecovery();
-            QTimer::singleShot(3'200, this, [this]() { showUpdateDialog(true); });
         });
     }
 
@@ -941,7 +940,7 @@ void MainWindow::saveWorkspace() {
     if (workspaceSessionId_.isEmpty()) return;
     saveWorkspace(currentWorkspaceRoot());
 
-    QSettings settings;
+    SettingsSnapshot settings;
     settings.setValue(QStringLiteral("workspace/geometry"), saveGeometry());
     settings.setValue(QStringLiteral("workspace/uiScaleLayout"), Theme::windowScaleState(*this));
     settings.setValue(QStringLiteral("workspace/windowState"), saveState(kWindowStateVersion));
@@ -949,14 +948,17 @@ void MainWindow::saveWorkspace() {
         primaryToolBar_ != nullptr && primaryToolBar_->isVisible());
     rememberNavigationView();
     settings.setValue(QStringLiteral("workspace/activeLayoutPreset"), navigationViewKey());
-    settings.sync();
+    QSettings stored;
+    if (settings.writeChanges(stored)) stored.sync();
 }
 
 void MainWindow::saveWorkspace(const QString& workspaceRoot) {
-    workspaceSnapshotSaved_ = false;
-    if (workspaceRoot.isEmpty()) return;
+    if (workspaceRoot.isEmpty()) {
+        workspaceSnapshotSaved_ = false;
+        return;
+    }
 
-    QSettings settings;
+    SettingsSnapshot settings;
     int restorableDocumentCount = 0;
     for (int index = 0; index < documentTabs_->count(); ++index) {
         QWidget* page = documentTabs_->widget(index);
@@ -975,6 +977,14 @@ void MainWindow::saveWorkspace(const QString& workspaceRoot) {
         primaryToolBar_ != nullptr && primaryToolBar_->isVisible());
     settings.setValue(workspaceRoot + QStringLiteral("/currentDocument"),
         documentTabs_->currentIndex());
+    decltype(savedWorkspaceTexts_) nextTexts;
+    const auto saveText = [&](const QString& array, int slot, QTextDocument* document) {
+        const QString key = array + QString::number(slot);
+        const auto stamp = qMakePair(QPointer<QTextDocument>(document), document->revision());
+        if (!workspaceSnapshotSaved_ || savedWorkspaceRoot_ != workspaceRoot || savedWorkspaceTexts_.value(key) != stamp)
+            settings.setValue(QStringLiteral("text"), document->toPlainText());
+        nextTexts.insert(key, stamp);
+    };
     settings.beginWriteArray(workspaceRoot + QStringLiteral("/sqlDocuments"));
     int savedIndex = 0;
     for (int index = 0; index < documentTabs_->count(); ++index) {
@@ -983,7 +993,7 @@ void MainWindow::saveWorkspace(const QString& workspaceRoot) {
         settings.setArrayIndex(savedIndex++);
         settings.setValue(QStringLiteral("filePath"), document->filePath());
         settings.setValue(QStringLiteral("tabIndex"), index);
-        settings.setValue(QStringLiteral("text"), document->editor()->toPlainText());
+        saveText(QStringLiteral("sql"), savedIndex - 1, document->editor()->document());
         settings.setValue(QStringLiteral("modified"), document->isModified());
         settings.setValue(QStringLiteral("customTitle"), document->customTitle());
         settings.setValue(QStringLiteral("connectionProfileId"), document->connectionProfileId());
@@ -1002,7 +1012,7 @@ void MainWindow::saveWorkspace(const QString& workspaceRoot) {
         settings.setValue(QStringLiteral("filePath"), command->filePath());
         settings.setValue(QStringLiteral("customTitle"), command->customTitle());
         settings.setValue(QStringLiteral("tabIndex"), index);
-        settings.setValue(QStringLiteral("text"), command->scriptText());
+        saveText(QStringLiteral("command"), savedIndex - 1, command->scriptDocument());
         settings.setValue(QStringLiteral("connectionProfileId"),
             command->connectionProfileId());
         settings.setValue(QStringLiteral("defineEnabled"), command->defineEnabled());
@@ -1037,12 +1047,22 @@ void MainWindow::saveWorkspace(const QString& workspaceRoot) {
     settings.endArray();
     settings.setValue(workspaceRoot + QStringLiteral("/documentCount"),
         restorableDocumentCount);
-    settings.setValue(workspaceRoot + QStringLiteral("/savedAt"),
-        QDateTime::currentDateTime().toString(Qt::ISODateWithMs));
     settings.setValue(QStringLiteral("workspaceHistory/sessions/%1/documentCount")
         .arg(workspaceSessionId_), restorableDocumentCount);
-    settings.sync();
-    workspaceSnapshotSaved_ = settings.status() == QSettings::NoError;
+    QSettings stored;
+    const bool changed = settings.writeChanges(stored);
+    if (changed) {
+        stored.setValue(workspaceRoot + QStringLiteral("/savedAt"),
+            QDateTime::currentDateTime().toString(Qt::ISODateWithMs));
+    }
+    // A failed flush must be retried even if QSettings already has the new
+    // values in its shared in-process cache.
+    if (changed || !workspaceSnapshotSaved_) stored.sync();
+    workspaceSnapshotSaved_ = stored.status() == QSettings::NoError;
+    if (workspaceSnapshotSaved_) {
+        savedWorkspaceRoot_ = workspaceRoot;
+        savedWorkspaceTexts_ = std::move(nextTexts);
+    }
 }
 
 QString MainWindow::currentWorkspaceRoot() const {
@@ -1268,10 +1288,11 @@ void MainWindow::openWorkspaceHistory(bool recoveryOnly, StartupSplash* startupS
         &dialog);
     QPushButton* open = buttons->button(QDialogButtonBox::Open);
     open->setObjectName(QStringLiteral("restoreWorkspaceInstances"));
+    open->setText(QStringLiteral("恢复"));
     const auto updateSelection = [history, open]() {
         int count = 0;
         for (auto* item : history->selectedItems()) if (!item->isDisabled()) ++count;
-        open->setText(QStringLiteral("恢复选中实例（%1）").arg(count));
+        open->setToolTip(QStringLiteral("已选 %1 个实例").arg(count));
         open->setEnabled(count > 0);
     };
     connect(history, &QTreeWidget::itemSelectionChanged, &dialog, updateSelection);
@@ -1299,7 +1320,7 @@ void MainWindow::openWorkspaceHistory(bool recoveryOnly, StartupSplash* startupS
         description->setText(QStringLiteral("选择要继续的工作实例。默认全部选中，可用 Ctrl／Shift 调整。"));
         history->setAccessibleName(QStringLiteral("启动恢复实例列表"));
         history->setUniformRowHeights(true);
-        buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("暂不恢复"));
+        buttons->button(QDialogButtonBox::Cancel)->setText(QStringLiteral("跳过"));
         buttons->button(QDialogButtonBox::Cancel)->setDefault(true);
     }
     const int decision = unifiedStartup ? startupSplash->execRecovery(dialog) : dialog.exec();
@@ -1375,6 +1396,32 @@ bool MainWindow::selfTestWorkspaceHistory(const QString& requestedScenario) {
     const QString running = prefix + QStringLiteral("-running"), claimed = prefix + QStringLiteral("-claimed");
     const QString unknown = prefix + QStringLiteral("-unknown"), empty = prefix + QStringLiteral("-empty");
     QScopedValueRollback<QString> target(workspaceSessionId_, prefix + QStringLiteral("-target"));
+    if (scenario == QStringLiteral("snapshot-idle")) {
+        auto* document = addSqlDocument(false);
+        document->editor()->setPlainText(QStringLiteral("SELECT 'snapshot';"));
+        saveWorkspace();
+        check(workspaceSnapshotSaved_, "SNAPSHOT_FIRST_SAVE_SUCCEEDS");
+        QSettings settings;
+        const QString savedAt = currentWorkspaceRoot() + QStringLiteral("/savedAt");
+        settings.setValue(savedAt, QStringLiteral("unchanged-marker"));
+        settings.sync();
+        saveWorkspace();
+        check(workspaceSnapshotSaved_ && settings.value(savedAt).toString() == QStringLiteral("unchanged-marker"),
+            "SNAPSHOT_IDLE_PRESERVES_SAVED_AT");
+        document->editor()->insertPlainText(QStringLiteral("-- edited"));
+        saveWorkspace();
+        check(workspaceSnapshotSaved_ && settings.value(savedAt).toString() != QStringLiteral("unchanged-marker")
+            && settings.value(currentWorkspaceRoot() + QStringLiteral("/sqlDocuments/1/text")).toString()
+                == document->editor()->toPlainText(), "SNAPSHOT_EDIT_PERSISTS_CONTENT");
+        documentTabs_->removeTab(documentTabs_->indexOf(document));
+        delete document;
+        saveWorkspace();
+        check(settings.value(currentWorkspaceRoot() + QStringLiteral("/sqlDocuments/size")).toInt() == 0,
+            "SNAPSHOT_CLOSE_PERSISTS_EMPTY_ARRAY");
+        settings.remove(QStringLiteral("workspaceHistory/sessions/") + workspaceSessionId_);
+        settings.sync();
+        return passed;
+    }
     const auto root = [](const QString& id) { return QStringLiteral("workspaceHistory/sessions/") + id; };
     QTemporaryDir files;
     QFile sharedFile(files.filePath(QStringLiteral("shared.sql")));
@@ -1486,7 +1533,8 @@ bool MainWindow::selfTestWorkspaceHistory(const QString& requestedScenario) {
                 list->clearSelection();
                 check(!open->isEnabled(), "WORKSPACE_HISTORY_EMPTY_SELECTION_DISABLED");
                 list->topLevelItem(1)->setSelected(true);
-                check(open->isEnabled() && open->text().contains(QStringLiteral("（1）")),
+                check(open->isEnabled() && open->text() == QStringLiteral("恢复")
+                        && open->toolTip() == QStringLiteral("已选 1 个实例"),
                     "WORKSPACE_HISTORY_SUBSET_COUNT");
             }
             if (scenario == QStringLiteral("locked"))
@@ -2722,6 +2770,7 @@ void MainWindow::createMetadataService() {
             failedMetadataProfileName_.clear();
             metadataLastHealthyAt_ = QDateTime::currentDateTime();
             metadataHealthFailure_.clear();
+            metadataProbeWarning_.clear();
             metadataHealthProbeInFlight_ = false;
             LanguageServerClient::instance()->resetMetadata(
                 profile.id, generation, profile.user, {});
@@ -2762,6 +2811,7 @@ void MainWindow::createMetadataService() {
                 || !pendingMetadataProfile_.id.isEmpty()) return;
             metadataHealthProbeInFlight_ = false;
             if (healthy) {
+                metadataProbeWarning_.clear();
                 metadataLastHealthyAt_ = QDateTime::currentDateTime();
                 if (failedMetadataProfileId_.isEmpty()
                     || failedMetadataProfileId_ == metadataProfile_.id) {
@@ -2771,7 +2821,12 @@ void MainWindow::createMetadataService() {
                 refreshConnectionNavigation();
                 return;
             }
-            markMetadataConnectionLost(error, generation);
+            if (error.connectionLost) {
+                markMetadataConnectionLost(error, generation);
+            } else {
+                metadataProbeWarning_ = QStringLiteral("最近健康检查失败（%1）：%2").arg(error.code).arg(error.message);
+                updateObjectConnectionStatus();
+            }
         });
     connect(metadataService_, &MetadataService::schemasReady,
         this, &MainWindow::populateSchemas);
@@ -3028,6 +3083,7 @@ void MainWindow::createMetadataService() {
             if (auto* view = findView(source.key)) view->applySource(source);
             if (ProgramDocumentWidget* program = findProgram(source.key)) {
                 program->applySource(source);
+
                 const int index = documentTabs_->indexOf(program);
                 if (index >= 0) {
                     documentTabs_->setTabText(index, program->displayName());
@@ -3038,7 +3094,9 @@ void MainWindow::createMetadataService() {
         [this](const ObjectKey& key, const SessionError& error, quint64 generation) {
             if (generation != metadataGeneration_) return;
             if (auto* view = findView(key)) view->setError(error.message);
-            if (auto* program = findProgram(key)) program->setError(key, error.message);
+            if (auto* program = findProgram(key)) {
+                program->setError(key, error.message);
+            }
         });
     connect(metadataService_, &MetadataService::testTargetsReady, this,
         [this](const ObjectKey& key, QVector<ProgramTarget> targets, quint64 generation) {
@@ -4108,15 +4166,6 @@ void MainWindow::createActionsAndMenus() {
         dialog.exec();
     });
     helpMenu->addAction(versionNotesAction);
-    auto* checkUpdateAction =
-        new QAction(QStringLiteral("检查更新…"), this);
-    checkUpdateAction->setStatusTip(
-        QStringLiteral("检查并下载经过签名验证的更新包"));
-    connect(checkUpdateAction, &QAction::triggered, this, [this]() {
-        showUpdateDialog(false);
-    });
-    helpMenu->addAction(checkUpdateAction);
-    checkUpdateAction->setVisible(ProductFeatures::internalHub);
     helpMenu->addSeparator();
     auto* aboutAction = new QAction(
         InterfaceIcons::icon(QStringLiteral(":/icons/about.svg")), QStringLiteral("关于小智达梦管理工具"), this);
@@ -4134,7 +4183,6 @@ void MainWindow::createActionsAndMenus() {
                 "达梦 DM8 跨平台客户端<br>"
                 "版本 %1<br><br>"
                 "开发者：Reid<br>"
-                "邮箱：<a href=\"mailto:FreeReid90@Gmail.com\">FreeReid90@Gmail.com</a>"
                 "<br><br>可在版本说明中查询各版本功能。")
                 .arg(QCoreApplication::applicationVersion()));
         if (QLabel* information = about.findChild<QLabel*>(
@@ -4213,73 +4261,6 @@ void MainWindow::createActionsAndMenus() {
     }
 }
 
-void MainWindow::showUpdateDialog(bool startupCheck) {
-    if (!ProductFeatures::internalHub) return;
-    if (updateDialog_ != nullptr) {
-        if (!startupCheck) {
-            updateDialog_->open();
-            updateDialog_->raise();
-            updateDialog_->activateWindow();
-        }
-        return;
-    }
-    auto* dialog = new UpdateDialog(this);
-    updateDialog_ = dialog;
-    dialog->setAttribute(Qt::WA_DeleteOnClose, true);
-    connect(dialog, &QDialog::finished, this,
-        [this, dialog](int result) {
-            if (result == QDialog::Accepted && dialog->installRequested()) {
-                installUpdateFromDialog(dialog);
-            }
-        });
-    if (startupCheck) {
-        dialog->beginStartupCheck();
-    } else {
-        dialog->open();
-    }
-}
-
-void MainWindow::installUpdateFromDialog(UpdateDialog* dialog) {
-    if (dialog == nullptr) return;
-    const reid::update::VerifiedInstallerCandidate candidate =
-        dialog->installerCandidate();
-    QString error;
-    if (!reid::update::UpdateInstallerLauncher::validate(candidate, &error)) {
-        QMessageBox::critical(this, QStringLiteral("无法安装更新"), error);
-        return;
-    }
-
-    const bool previousQuitOnLastWindowClosed = qApp->quitOnLastWindowClosed();
-    qApp->setQuitOnLastWindowClosed(false);
-    if (!close()) {
-        qApp->setQuitOnLastWindowClosed(previousQuitOnLastWindowClosed);
-        return;
-    }
-    if (!reid::update::UpdateInstallerLauncher::launch(candidate, &error)) {
-        if (!workspaceSessionId_.isEmpty()) {
-            QSettings settings;
-            const QString root = QStringLiteral("workspaceHistory/sessions/%1")
-                .arg(workspaceSessionId_);
-            settings.setValue(root + QStringLiteral("/outcome"), QStringLiteral("running"));
-            settings.remove(root + QStringLiteral("/endedAt"));
-            settings.sync();
-            if (workspaceSnapshotTimer_ != nullptr) workspaceSnapshotTimer_->start();
-        }
-        show();
-        qApp->setQuitOnLastWindowClosed(previousQuitOnLastWindowClosed);
-        QMessageBox::critical(this, QStringLiteral("无法安装更新"), error);
-        return;
-    }
-    QSettings settings;
-    if (!workspaceSessionId_.isEmpty()) {
-        settings.setValue(QStringLiteral("workspaceHistory/sessions/%1/updatePending")
-            .arg(workspaceSessionId_), true);
-    }
-    settings.sync();
-    (void)LanguageServerClient::instance()->stopAndWait();
-    qApp->setQuitOnLastWindowClosed(previousQuitOnLastWindowClosed);
-    QTimer::singleShot(0, qApp, &QCoreApplication::quit);
-}
 
 void MainWindow::createToolBars() {
     primaryToolBar_ = addToolBar(QStringLiteral("主工具栏"));
@@ -5959,11 +5940,13 @@ void MainWindow::updateObjectConnectionStatus() {
         tooltip = QStringLiteral("正在建立对象浏览连接：%1｜用户：%2")
             .arg(pendingMetadataProfile_.name, pendingMetadataProfile_.user);
     } else if (!metadataProfile_.id.isEmpty()) {
-        text = QStringLiteral("对象连接：已连接");
+        text = metadataProbeWarning_.isEmpty() ? QStringLiteral("对象连接：已连接")
+            : QStringLiteral("对象连接：待复核");
         tooltip = QStringLiteral("对象浏览已连接：%1｜用户：%2")
             .arg(metadataProfile_.name, metadataProfile_.user);
+        if (!metadataProbeWarning_.isEmpty()) tooltip.append(QStringLiteral("｜") + metadataProbeWarning_);
         if (metadataLastHealthyAt_.isValid()) {
-            tooltip.append(QStringLiteral("｜最近检测：%1")
+            tooltip.append(QStringLiteral("｜最近成功检测：%1")
                 .arg(metadataLastHealthyAt_.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"))));
         }
     } else if (!failedMetadataProfileId_.isEmpty()) {
@@ -6054,6 +6037,7 @@ void MainWindow::disconnectApplicationProfile(const QString& profileId) {
 }
 
 void MainWindow::resetMetadataConnectionState() {
+    metadataProbeWarning_.clear();
     metadataHealthCheckTimer_->stop();
     metadataHealthProbeInFlight_ = false;
     nextMetadataGeneration_ = qMax(nextMetadataGeneration_, metadataGeneration_) + 1;
@@ -6112,6 +6096,13 @@ bool MainWindow::selfTestApplicationDisconnect() {
     document->setConnectionPending(profile, QStringLiteral("Fixture: no physical connection"));
     document->editor()->setPlainText(QStringLiteral("SELECT 1;"));
     metadataProfile_ = profile;  // UI state only; never open a database connection.
+    emit metadataService_->connectionHealthChecked(false,
+        {QStringLiteral("HealthProbe"), -608, QStringLiteral("请求执行超时"), {}}, metadataGeneration_);
+    if (!check(metadataProfile_.id == profile.id && !metadataProbeWarning_.isEmpty()
+            && failedMetadataProfileId_.isEmpty(), "Probe timeout invalidated the application connection")) return false;
+    emit metadataService_->connectionHealthChecked(true, {}, metadataGeneration_);
+    if (!check(metadataProbeWarning_.isEmpty() && metadataLastHealthyAt_.isValid(),
+            "Successful probe did not clear the transient warning")) return false;
     if (!check(canDisconnectApplicationProfile(profile.id) && !canDisconnectApplicationProfile(otherId),
             "Disconnect qualification did not match the active application profile")) return false;
     pendingMetadataProfile_ = profile;
@@ -8054,7 +8045,8 @@ void MainWindow::rememberNavigationView() {
         QSettings settings;
         auto stored = settings.value(QStringLiteral("workspace/navigationViews")).toMap();
         stored.insert(navigationViewKey(), navigationViews_.value(navigationViewKey()));
-        settings.setValue(QStringLiteral("workspace/navigationViews"), stored);
+        if (settings.value(QStringLiteral("workspace/navigationViews")).toMap() != stored)
+            settings.setValue(QStringLiteral("workspace/navigationViews"), stored);
     }
 }
 
@@ -13336,7 +13328,8 @@ void MainWindow::openProgram(const ObjectKey& key, bool newObject) {
     const quint64 generation = metadataGeneration_;
     QMetaObject::invokeMethod(metadataService_, [this, primaryKey, generation]() {
         metadataService_->loadProgramSource(primaryKey, generation);
-        metadataService_->loadDependencies(primaryKey, generation);
+        if (primaryKey.type != DatabaseObjectType::Package)
+            metadataService_->loadDependencies(primaryKey, generation);
         if (primaryKey.type == DatabaseObjectType::View) {
             metadataService_->loadColumns(primaryKey, generation);
         }
@@ -13345,8 +13338,9 @@ void MainWindow::openProgram(const ObjectKey& key, bool newObject) {
         ObjectKey body = primaryKey;
         body.type = DatabaseObjectType::PackageBody;
         program->setLoading(body);
-        QMetaObject::invokeMethod(metadataService_, [this, body, generation]() {
+        QMetaObject::invokeMethod(metadataService_, [this, body, primaryKey, generation]() {
             metadataService_->loadProgramSource(body, generation);
+            metadataService_->loadDependencies(primaryKey, generation);
         }, Qt::QueuedConnection);
     }
     syncWindowBrowser();
@@ -14387,7 +14381,8 @@ bool MainWindow::hasUsableLayout() const {
                 labels.append(action->objectName()==QStringLiteral("packageBodyBackupsAction")?QStringLiteral("包体备份与恢复"):action->text());
             }
             return labels==QStringList{
-                QStringLiteral("DBA 管理"),QStringLiteral("包体备份与恢复"),QStringLiteral("清理历史记录…"),QStringLiteral("数据库参数"),QStringLiteral("数据版本"),QStringLiteral("数据库许可证"),QStringLiteral("代码补全")};
+                QStringLiteral("DBA 管理"),QStringLiteral("包体备份与恢复"),QStringLiteral("清理历史记录…"),QStringLiteral("数据库参数"),QStringLiteral("数据版本"),QStringLiteral("数据库许可证"),QStringLiteral("代码补全"),
+            };
         }())
         && report(QStringLiteral("formatActionExists"), formatAction_ != nullptr)
         && report(QStringLiteral("queryVersionActionExists"), queryVersionAction_ != nullptr)

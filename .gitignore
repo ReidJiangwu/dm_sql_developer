@@ -61,5 +61,5 @@ Thumbs.db
 .claude/
 .ecc/
 
-# Local Resource Hub credentials
-/gzyd-dm-tools-integration-with-keys.md
+# Local credential documents
+*-with-keys.md

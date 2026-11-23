@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/CommandScript.h"
+#include "../core/ProductFeatures.h"
 #include "../core/CommandReconnectSettings.h"
 #include "../core/CommandParallelPlan.h"
 #include "../core/ConnectionProfile.h"
@@ -35,6 +36,7 @@ class QToolButton;
 class QTreeWidget;
 class QTreeWidgetItem;
 class SqlEditor;
+class QTextDocument;
 
 class CommandDocumentWidget final : public QWidget {
     Q_OBJECT
@@ -58,6 +60,7 @@ public:
     [[nodiscard]] bool isBusy() const;
     [[nodiscard]] bool canCancel() const;
     [[nodiscard]] bool hasPendingTransaction() const;
+    [[nodiscard]] QTextDocument* scriptDocument() const;
     [[nodiscard]] QString scriptText() const;
     [[nodiscard]] QString filePath() const;
     [[nodiscard]] bool defineEnabled() const;
@@ -311,6 +314,7 @@ private:
     CommandSourceLocation currentSqlSource_;
     CommandSourceLocation currentProgressSource_;
     QString currentSqlText_;
+    qint64 skippedCacheUnits_ = 0;
     CommandSourceLocation lastSqlBufferSource_;
     QString lastSqlBuffer_;
     QString currentRunningFile_;
@@ -363,6 +367,7 @@ private:
         int endUnit = 0;
         qint64 processed = 0;
         qint64 succeeded = 0;
+        qint64 skippedCacheUnits = 0;
         qint64 failed = 0;
         QMap<QString, QString> variables;
         QMap<QString, QString> executionVariables;
@@ -435,7 +440,11 @@ private:
     bool planTextOverrideActive_ = false;
     QString planTextOverride_;
     QString planSourceOverride_;
-    QQueue<QString> outputBlocks_;
+    struct OutputBlockSize {
+        qint64 bytes;
+        int documentCharacters;
+    };
+    QQueue<OutputBlockSize> outputBlocks_;
     QList<int> outputExpandedSizes_;
     qint64 outputBytes_ = 0;
     bool outputTruncated_ = false;

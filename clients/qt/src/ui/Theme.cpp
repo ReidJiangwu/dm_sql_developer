@@ -995,7 +995,6 @@ QString createStyleSheet(bool dark) {
         QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled, QDateTimeEdit::down-arrow:disabled {
             image: url(:/theme/chevron-@theme@-disabled.svg);
         }
-        
         QCheckBox::indicator {
             width: 14px;
             height: 14px;
@@ -1621,7 +1620,6 @@ QString createStyleSheet(bool dark) {
             border-radius: 7px;
         }
         QDialog#connectionDialog QLabel#connectionStatus,
-        QDialog#updateDialog QLabel#updateStatusLabel,
         QDialog#versionNotesDialog QLabel#versionNotesMessage {
             color: %5;
         }
@@ -1633,67 +1631,6 @@ QString createStyleSheet(bool dark) {
         }
         QDialog#connectionFailureDialog QLabel#connectionFailureDetail {
             color: %4;
-        }
-        QDialog#updateDialog QLabel#updateCurrentVersion,
-        QDialog#updateDialog QLabel#updateStatusTitle {
-            font-weight: 600;
-        }
-        QDialog#updateDialog QLabel#updateVersionCaption,
-        QDialog#updateDialog QLabel#updateChannelLabel,
-        QDialog#updateDialog QLabel#updateDetailsLabel {
-            color: %5;
-        }
-        QDialog#updateDialog QWidget#updateVersionPanel {
-            background: transparent;
-            border: 0;
-        }
-        QDialog#updateDialog QLabel#updateCurrentVersion {
-            background: %9;
-            border-radius: 4px;
-            padding: 3px 8px;
-        }
-        QDialog#updateDialog QWidget#updateStatusPanel {
-            background: %3;
-            border: 1px solid %6;
-            border-radius: 6px;
-        }
-        QDialog#updateDialog QWidget#updateAdvancedPanel {
-            background: %3;
-            border: 1px solid %6;
-            border-radius: 6px;
-        }
-        QDialog#updateDialog QWidget#updateActionBar {
-            background: transparent;
-            border: 0;
-        }
-        QDialog#updateDialog QWidget#updateActionBar QPushButton {
-            min-width: 76px;
-            min-height: 28px;
-            padding: 0 10px;
-        }
-        QDialog#updateDialog QToolButton#updateAdvancedToggle,
-        QDialog#updateDialog QToolButton#updateDetailsButton {
-            min-height: 24px;
-            padding: 2px 6px;
-            background: transparent;
-            border: 1px solid transparent;
-        }
-        QDialog#updateDialog QWidget#updateStatusPanel[statusKind="success"] {
-            background: %9;
-            border-color: %7;
-        }
-        QDialog#updateDialog QWidget#updateStatusPanel[statusKind="error"] {
-            background: %13;
-            border-color: %8;
-        }
-        QDialog#updateDialog QWidget#updateStatusPanel[statusKind="error"] QLabel#updateStatusTitle {
-            color: %8;
-        }
-        QDialog#updateDialog QTextBrowser#updateReleaseNotes {
-            background: %3;
-            border: 1px solid %6;
-            border-radius: 6px;
-            padding: 6px 8px;
         }
         QDialog#versionNotesDialog QListWidget#versionNotesList {
             background: %3;
@@ -1731,10 +1668,7 @@ QString createStyleSheet(bool dark) {
             border-radius: 5px;
             padding: 3px 8px;
         }
-        QDialog#versionNotesDialog QPushButton#closeVersionNotesButton,
-        QDialog#updateDialog QPushButton#closeUpdateButton,
-        QDialog#updateDialog QPushButton#openUpdateFolderButton,
-        QDialog#updateDialog QPushButton#cancelUpdateButton {
+        QDialog#versionNotesDialog QPushButton#closeVersionNotesButton {
             color: %4;
             background: %2;
             border: 1px solid %6;
@@ -1743,10 +1677,7 @@ QString createStyleSheet(bool dark) {
             padding: 0 12px;
             font-weight: 400;
         }
-        QDialog#versionNotesDialog QPushButton#closeVersionNotesButton:hover,
-        QDialog#updateDialog QPushButton#closeUpdateButton:hover,
-        QDialog#updateDialog QPushButton#openUpdateFolderButton:hover,
-        QDialog#updateDialog QPushButton#cancelUpdateButton:hover {
+        QDialog#versionNotesDialog QPushButton#closeVersionNotesButton:hover {
             background: %9;
             border-color: %7;
         }

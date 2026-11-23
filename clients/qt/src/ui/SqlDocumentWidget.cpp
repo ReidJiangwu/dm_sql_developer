@@ -251,17 +251,26 @@ QByteArray SqlDocumentWidget::gridWorkspaceState() const {
             table->horizontalHeader()->sortIndicatorSection());
         state.insert(QStringLiteral("sortOrder"),
             static_cast<int>(table->horizontalHeader()->sortIndicatorOrder()));
-        QJsonArray columns;
-        for (int visual = 0; visual < table->model()->columnCount(); ++visual) {
-            const int logical = table->horizontalHeader()->logicalIndex(visual);
-            QJsonObject column;
-            column.insert(QStringLiteral("logical"), logical);
-            column.insert(QStringLiteral("width"), table->columnWidth(logical));
-            columns.append(column);
+        const QByteArray header = table->horizontalHeader()->saveState();
+        if (cachedGridHeader_ != header || cachedGridColumns_.size() != table->model()->columnCount()
+                || cachedGridTable_ != table || cachedGridViewportWidth_ != table->viewport()->width()) {
+            cachedGridColumns_ = {};
+            for (int visual = 0; visual < table->model()->columnCount(); ++visual) {
+                const int logical = table->horizontalHeader()->logicalIndex(visual);
+                cachedGridColumns_.append(QJsonObject{{QStringLiteral("logical"), logical},
+                    {QStringLiteral("width"), table->columnWidth(logical)}});
+            }
+            cachedGridHeader_ = header;
+            cachedGridTable_ = table;
+            cachedGridViewportWidth_ = table->viewport()->width();
         }
-        state.insert(QStringLiteral("columns"), columns);
+        state.insert(QStringLiteral("columns"), cachedGridColumns_);
     }
-    return QJsonDocument(state).toJson(QJsonDocument::Compact);
+    if (cachedGridState_ != state) {
+        cachedGridState_ = state;
+        cachedGridBytes_ = QJsonDocument(state).toJson(QJsonDocument::Compact);
+    }
+    return cachedGridBytes_;
 }
 
 void SqlDocumentWidget::restoreGridWorkspaceState(const QByteArray& state) {
@@ -269,8 +278,8 @@ void SqlDocumentWidget::restoreGridWorkspaceState(const QByteArray& state) {
     if (!document.isObject() || document.object().value(QStringLiteral("version")).toInt() != 1) {
         return;
     }
-    restoredGridWorkspaceState_ = state;
     const QJsonObject object = document.object();
+    restoredGridWorkspaceState_ = object;
     const int pageSize = object.value(QStringLiteral("pageSize")).toInt(200);
     if (pageSizeCombo_ != nullptr && pageSizeCombo_->findText(QString::number(pageSize)) >= 0) {
         pageSizeCombo_->setCurrentText(QString::number(pageSize));
@@ -288,9 +297,8 @@ void SqlDocumentWidget::restoreGridWorkspaceState(const QByteArray& state) {
 }
 
 void SqlDocumentWidget::applyGridWorkspaceState(int resultIndex, bool includeColumns) {
-    const QJsonDocument document = QJsonDocument::fromJson(restoredGridWorkspaceState_);
-    if (!document.isObject()) return;
-    const QJsonObject state = document.object();
+    const auto& state = restoredGridWorkspaceState_;
+    if (state.isEmpty()) return;
     QTableView* table = resultTables_.value(resultIndex);
     QLineEdit* filter = resultFilters_.value(resultIndex);
     QComboBox* preset = resultDisplayPresets_.value(resultIndex);
@@ -305,12 +313,14 @@ void SqlDocumentWidget::applyGridWorkspaceState(int resultIndex, bool includeCol
         const int logical = column.value(QStringLiteral("logical")).toInt(-1);
         if (logical < 0 || logical >= table->model()->columnCount()) continue;
         const int currentVisual = table->horizontalHeader()->visualIndex(logical);
-        if (currentVisual >= 0 && currentVisual != visual) {
+        if (currentVisual >= 0 && currentVisual != visual && visual < table->model()->columnCount()) {
             table->horizontalHeader()->moveSection(currentVisual, visual);
         }
-        table->setColumnWidth(logical,
-            qBound(40, qRound(column.value(QStringLiteral("width")).toInt(100)
+        const int width = column.value(QStringLiteral("width")).toInt(-1);
+        if (width > 0) {
+            table->setColumnWidth(logical, qBound(40, qRound(width
                 * Theme::restoredUiScaleRatio(state.value(QStringLiteral("uiScaleBasisPercent")).toInt())), 2000));
+        }
     }
     const int sortColumn = state.value(QStringLiteral("sortColumn")).toInt(-1);
     if (sortColumn >= 0 && sortColumn < table->model()->columnCount()) {
@@ -959,6 +969,7 @@ SqlDocumentWidget::SqlDocumentWidget(int documentNumber, QWidget* parent)
     session_ = new DpiSession();
     session_->setDeferredLobRead(true);
     session_->moveToThread(sessionThread_);
+
     auto* completionClient = LanguageServerClient::instance();
     completionClient->bindSqlEditor(editor_, {});
     connect(completionClient, &LanguageServerClient::sqlColumnsRequested, this,
@@ -989,8 +1000,7 @@ SqlDocumentWidget::SqlDocumentWidget(int documentNumber, QWidget* parent)
             actualEndpoint_ = endpoint; actualIdentity_ = identity;
         });
     connect(session_, &DpiSession::connected, this, [this](const ConnectionProfile& profile) {
-        LanguageServerClient::instance()->bindSqlEditor(editor_, profile.id);
-        LanguageServerClient::instance()->invalidateSqlMetadata(editor_);
+        LanguageServerClient::instance()->bindSqlEditor(editor_, profile.id, true);
         const bool connectionChanged = !profile_.id.isEmpty() && profile_.id != profile.id;
         profile_ = profile;
         connectingProfile_ = {};
@@ -1227,8 +1237,7 @@ void SqlDocumentWidget::requestConnectionSwitch(
 
 void SqlDocumentWidget::beginConnectionSwitch(
     ConnectionProfile profile, QByteArray password) {
-    LanguageServerClient::instance()->bindSqlEditor(editor_, {});
-    LanguageServerClient::instance()->invalidateSqlMetadata(editor_);
+    LanguageServerClient::instance()->bindSqlEditor(editor_, {}, true);
     state_ = SessionState::Connecting;
     stateDetail_ = QStringLiteral("正在连接：%1").arg(profile.name);
     connectingProfile_ = profile;
@@ -1261,8 +1270,7 @@ void SqlDocumentWidget::disconnectDatabase() {
 }
 
 void SqlDocumentWidget::setConnectionPending(ConnectionProfile profile, QString detail) {
-    LanguageServerClient::instance()->bindSqlEditor(editor_, {});
-    LanguageServerClient::instance()->invalidateSqlMetadata(editor_);
+    LanguageServerClient::instance()->bindSqlEditor(editor_, {}, true);
     profile_ = std::move(profile);
     actualEndpoint_ = {}; actualIdentity_ = {};
     executionFeedbackTimer_->stop();
@@ -2129,8 +2137,7 @@ void SqlDocumentWidget::handleState(SessionState state, const QString& detail) {
     }
     appendSessionEvent(QStringLiteral("状态"), detail);
     if (state == SessionState::Disconnected) {
-        LanguageServerClient::instance()->bindSqlEditor(editor_, {});
-        LanguageServerClient::instance()->invalidateSqlMetadata(editor_);
+        LanguageServerClient::instance()->bindSqlEditor(editor_, {}, true);
         databaseTransactionPending_ = false;
         serverOutputEnabled_ = false;
         serverOutputAction_->setChecked(false);
@@ -2500,7 +2507,7 @@ void SqlDocumentWidget::handleError(const SessionError& error) {
 
 void SqlDocumentWidget::handleExecutionFinished(const QString& sql, const QString& operation,
     qint64 elapsedMs, qint64 rows, bool success, int errorCode, const QString& error,
-    bool isPlan, quint64 executionId, quint64 sessionEpoch) {
+    bool isPlan, quint64 executionId, quint64 sessionEpoch, const QString& failureDetail) {
     if (!isPlan && executionId == 0 && (sessionEpoch_ != 0 || activeExecutionId_ != 0)) {
         appendSessionEvent(QStringLiteral("执行完成已忽略"),
             QStringLiteral("没有执行身份的完成事件不能结束活动执行。"));
@@ -2551,7 +2558,7 @@ void SqlDocumentWidget::handleExecutionFinished(const QString& sql, const QStrin
     record.rows = rows;
     record.success = success;
     record.errorCode = errorCode;
-    record.error = error;
+    record.error = failureDetail.isEmpty() ? error : failureDetail + QLatin1Char('\n') + error;
     record.sql = sql;
     emit executionCompleted(record);
     if (executionId != 0 && success) {
@@ -2977,8 +2984,19 @@ void SqlDocumentWidget::fitFirstBatchColumns(int resultIndex) {
     QTableView* table = resultTables_.value(resultIndex);
     QueryResultModel* model = resultModels_.value(resultIndex);
     if (table == nullptr || model == nullptr) return;
-    table->resizeColumnsToContents();
-    for (int column = 0; column < model->columnCount(); ++column) {
+    const int count = model->columnCount();
+    QSet<int> savedWidths;
+    const QJsonArray columns = restoredGridWorkspaceState_.value(QStringLiteral("columns")).toArray();
+    for (const auto& entry : columns) {
+        const auto column = entry.toObject();
+        const int logical = column.value(QStringLiteral("logical")).toInt(-1);
+        if (logical >= 0 && logical < count && column.value(QStringLiteral("width")).toInt(-1) > 0)
+            savedWidths.insert(logical);
+    }
+    if (savedWidths.isEmpty()) table->resizeColumnsToContents();
+    for (int column = 0; column < count; ++column) {
+        if (savedWidths.contains(column)) continue;
+        if (!savedWidths.isEmpty()) table->resizeColumnToContents(column);
         table->setColumnWidth(column, qBound(88, table->columnWidth(column) + 12, 320));
     }
     applyGridWorkspaceState(resultIndex, true);

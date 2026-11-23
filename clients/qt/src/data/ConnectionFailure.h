@@ -22,6 +22,12 @@ struct EndpointProbeResult {
 
 class ConnectionFailure final {
 public:
+    [[nodiscard]] static bool indicatesBrokenConnection(const SessionError& error) {
+        return error.code == -70025
+            || error.message.contains(QStringLiteral("连接未打开"), Qt::CaseInsensitive)
+            || error.message.contains(QStringLiteral("connection is not open"), Qt::CaseInsensitive)
+            || error.message.contains(QStringLiteral("connection not open"), Qt::CaseInsensitive);
+    }
     [[nodiscard]] static EndpointProbeResult probe(
         const QString& host, int port, int timeoutMs);
     [[nodiscard]] static SessionError classify(SessionError nativeError,

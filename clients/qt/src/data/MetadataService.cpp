@@ -1,3 +1,5 @@
+#include <QDebug>
+#include <QElapsedTimer>
 #include "NativeProgramDiagnostics.h"
 #include "MetadataService.h"
 #include "PackageBodyBackupStore.h"
@@ -566,9 +568,10 @@ void MetadataService::connectToDatabase(
 
 void MetadataService::probeConnection(quint64 generation) {
     if (generation != generation_ || connection_ == nullptr) {
-        emit connectionHealthChecked(false,
-            {QStringLiteral("Connection"), 0, QStringLiteral("对象连接不可用或检测请求已过期。"),
-                QStringLiteral("重新连接数据库后重试。")}, generation);
+        SessionError error{QStringLiteral("Connection"), 0, QStringLiteral("对象连接不可用或检测请求已过期。"),
+            QStringLiteral("重新连接数据库后重试。")};
+        error.connectionLost = generation == generation_ && connection_ == nullptr;
+        emit connectionHealthChecked(false, error, generation);
         return;
     }
 
@@ -585,11 +588,17 @@ void MetadataService::probeConnection(quint64 generation) {
         result = dpi_exec_direct(statement, query);
     }
     if (!DSQL_SUCCEEDED(result)) {
-        const SessionError error = diagnostic(DSQL_HANDLE_STMT, statement,
-            QStringLiteral("Connection"),
-            QStringLiteral("确认数据库服务后重新连接对象连接。"));
+        SessionError error = statement
+            ? diagnostic(DSQL_HANDLE_STMT, statement, QStringLiteral("HealthProbe"), {})
+            : diagnostic(DSQL_HANDLE_DBC, connection_, QStringLiteral("HealthProbe"), {});
+        sdint4 dead = DSQL_CD_FALSE;
+        sdint4 length = 0;
+        const DPIRETURN health = dpi_get_con_attr(connection_, DSQL_ATTR_CONNECTION_DEAD,
+            &dead, static_cast<sdint4>(sizeof(dead)), &length);
+        error.connectionLost = ConnectionFailure::indicatesBrokenConnection(error)
+            || (DSQL_SUCCEEDED(health) && dead == DSQL_CD_TRUE);
         if (statement != nullptr) dpi_free_stmt(statement);
-        clearConnection();
+        if (error.connectionLost) clearConnection();
         emit connectionHealthChecked(false, error, generation);
         return;
     }
@@ -1825,8 +1834,12 @@ void MetadataService::loadTestTargets(ObjectKey key, quint64 generation) {
 }
 
 void MetadataService::loadProgramSource(ObjectKey key, quint64 generation) {
+    static const bool trace = qEnvironmentVariableIntValue("GZYD_PERF_TRACE") == 1;
+    QElapsedTimer timer;
+    if (trace) timer.start();
     SessionError error;
     const QString source = readProgramSource(key, generation, &error);
+    const auto readUs = trace ? timer.nsecsElapsed() / 1000 : 0;
     if (!error.message.isEmpty() && key.type == DatabaseObjectType::PackageBody
             && error.category == QStringLiteral("NotFound")) {
         SessionError existenceError;
@@ -1885,8 +1898,11 @@ void MetadataService::loadProgramSource(ObjectKey key, quint64 generation) {
             status = rows.front().value(0).trimmed();
         }
     }
-    emit programSourceReady(
-        {key, source, false, sourceFingerprint(source), true, status}, generation);
+    const auto fingerprint = sourceFingerprint(source);
+    if (trace) qInfo() << "program source" << static_cast<int>(key.type) << source.size()
+                       << "UTF-16 units, read" << readUs << "us, status and fingerprint"
+                       << timer.nsecsElapsed() / 1000 - readUs << "us";
+    emit programSourceReady({key, source, false, fingerprint, true, status}, generation);
 }
 
 QString MetadataService::readProgramSource(

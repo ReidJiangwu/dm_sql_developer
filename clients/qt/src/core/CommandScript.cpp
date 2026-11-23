@@ -1,3 +1,4 @@
+#include "ProductFeatures.h"
 #include "CommandScript.h"
 
 #include "SqlSafetyAnalyzer.h"
@@ -34,7 +35,7 @@
 namespace {
 
 constexpr quint32 kPlanMagic = 0x52444350;
-constexpr quint16 kPlanVersion = 3;
+constexpr quint16 kPlanVersion = 4;
 constexpr int kMaximumIncludeFiles = 256;
 constexpr qint64 kMaximumPlanFiles = 100'000;
 constexpr int kMaximumPlanErrors = 100;
@@ -557,6 +558,11 @@ QString decode(const QByteArray& bytes, QString* encoding, QString* error) {
     return {};
 }
 
+QVector<CommandUnit> parseFileSnapshot(const QString& script, const QString& canonical) {
+    auto units = CommandScript::parse(script, canonical);
+    return units;
+}
+
 void loadRecursive(const QString& path, const QString& workingDirectory,
     int depth, QStringList* stack, CommandScriptLoadResult* result) {
     if (depth >= kMaximumIncludeFiles) {
@@ -592,7 +598,7 @@ void loadRecursive(const QString& path, const QString& workingDirectory,
     result->files.append(QStringLiteral("%1 [%2, %3 bytes]")
         .arg(canonical, encoding).arg(bytes.size()));
     stack->append(canonical);
-    const QVector<CommandUnit> units = CommandScript::parse(script, canonical);
+    const QVector<CommandUnit> units = parseFileSnapshot(script, canonical);
     for (const CommandUnit& unit : units) {
         if (unit.type != CommandUnitType::Include
                 && unit.type != CommandUnitType::IncludeRelative) {
@@ -613,7 +619,7 @@ void writeUnit(QDataStream* stream, const CommandUnit& unit) {
     *stream << static_cast<qint32>(unit.type) << unit.text << unit.argument << unit.arguments
             << unit.source.file << unit.source.line << unit.source.column
             << unit.source.offset << unit.source.endLine << unit.source.endColumn
-            << unit.source.includeChain << unit.rememberedVariables;
+            << unit.source.includeChain << unit.rememberedVariables << unit.isVrtCreationBlock;
 }
 
 bool readUnit(QDataStream* stream, CommandUnit* unit) {
@@ -621,7 +627,7 @@ bool readUnit(QDataStream* stream, CommandUnit* unit) {
     *stream >> type >> unit->text >> unit->argument >> unit->arguments
             >> unit->source.file >> unit->source.line >> unit->source.column
             >> unit->source.offset >> unit->source.endLine >> unit->source.endColumn
-            >> unit->source.includeChain >> unit->rememberedVariables;
+            >> unit->source.includeChain >> unit->rememberedVariables >> unit->isVrtCreationBlock;
     if (stream->status() != QDataStream::Ok) return false;
     unit->type = static_cast<CommandUnitType>(type);
     return type >= static_cast<qint32>(CommandUnitType::Sql)
@@ -769,7 +775,7 @@ void planFile(const QString& path, const QString& commandBase,
             addPlanError(context, QStringLiteral("%1：%2").arg(canonical, decodeError));
             return;
         }
-        units = CommandScript::parse(script, canonical);
+        units = parseFileSnapshot(script, canonical);
         sourceDirectory = QFileInfo(canonical).absolutePath();
         if (byteCount <= kMaximumCachedScriptSize
                 && context->cachedScriptBytes + byteCount <= kMaximumCachedScriptBytes) {
@@ -1521,7 +1527,7 @@ CommandScriptLoadResult CommandScript::loadFileShallow(
     const QString relativeBase = QFileInfo(canonical).absolutePath();
     QStringList includeChain = parentIncludeChain;
     includeChain.append(canonical);
-    for (CommandUnit unit : parse(script, canonical)) {
+    for (CommandUnit unit : parseFileSnapshot(script, canonical)) {
         unit.source.includeChain = includeChain;
         if (unit.type == CommandUnitType::Include
                 || unit.type == CommandUnitType::IncludeRelative) {

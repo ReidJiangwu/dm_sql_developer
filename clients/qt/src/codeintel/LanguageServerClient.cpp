@@ -5,6 +5,8 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QDebug>
+#include <QScopeGuard>
 #include <QEventLoop>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -13,14 +15,18 @@
 #include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QTextCursor>
+#include <QTextDocumentFragment>
 #include <QTextBlock>
 #include <QToolTip>
 #include <QTimer>
 #include <QUuid>
 #include <utility>
+#include <algorithm>
 
 namespace {
 constexpr int kMaxFrameBytes = 16 * 1024 * 1024;
+constexpr int kMaxMetadataBytes = 4 * 1024 * 1024;
+constexpr int kMaxStderrBytes = 4096;
 
 QVector<CodeSymbol> parseSymbols(const QJsonArray& values) {
     QVector<CodeSymbol> symbols;
@@ -66,10 +72,22 @@ LanguageServerClient::LanguageServerClient(QObject* parent)
     connect(process_, &QProcess::readyReadStandardOutput,
         this, &LanguageServerClient::consumeOutput);
     connect(process_, &QProcess::readyReadStandardError, this, [this]() {
-        process_->readAllStandardError();
+        stderrTail_ = (stderrTail_ + process_->readAllStandardError()).right(kMaxStderrBytes);
     });
     connect(process_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
-        this, [this](int, QProcess::ExitStatus) {
+        this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
+            stderrTail_ = (stderrTail_ + process_->readAllStandardError()).right(kMaxStderrBytes);
+            QString reason = exitStatus == QProcess::CrashExit
+                ? QStringLiteral("进程异常终止")
+                : QStringLiteral("退出码 %1").arg(exitCode);
+            // Classify known diagnostics without exposing source text or connection data.
+            if (stderrTail_.contains("metadata notification exceeds 4 MiB")) {
+                reason += QStringLiteral("；元数据超过 4 MiB");
+            } else if (stderrTail_.contains("stack overflow") || stderrTail_.contains("overflowed its stack")) {
+                reason += QStringLiteral("；线程栈溢出");
+            } else if (stderrTail_.contains("panicked at")) {
+                reason += QStringLiteral("；Rust 运行异常");
+            }
             initialized_ = false;
             const QList<SqlEditor*> queuedEditors = queuedFormatting_.keys();
             queuedFormatting_.clear();
@@ -81,7 +99,8 @@ LanguageServerClient::LanguageServerClient(QObject* parent)
             }
             pendingCompletions_.clear();
             pendingFormatting_.clear();
-            failSymbolRequests(QStringLiteral("语言服务已退出，请刷新包以重新解析成员。"));
+            failSymbolRequests(QStringLiteral("语言服务已退出（%1），请刷新包以重新解析成员。")
+                .arg(reason));
             const auto definitions = pendingDefinitions_;
             pendingDefinitions_.clear();
             for (const auto& pending : definitions) {
@@ -146,6 +165,7 @@ void LanguageServerClient::startProcess() {
     const QString serverPath = resolveServerPath();
     if (serverPath.isEmpty()) return;
     readBuffer_.clear();
+    stderrTail_.clear();
     process_->setProgram(serverPath);
     process_->setArguments({});
     process_->start();
@@ -201,7 +221,7 @@ void LanguageServerClient::registerEditor(SqlEditor* editor) {
     DocumentState state;
     state.uri = QStringLiteral("untitled:reiddmtools/%1.sql")
         .arg(QUuid::createUuid().toString(QUuid::WithoutBraces));
-    state.text = editor->toPlainText();
+    state.resetText(editor->toPlainText());
     state.connectionId = defaultConnectionId_;
     documents_.insert(editor, state);
     connect(editor->document(), &QTextDocument::contentsChange, this,
@@ -219,7 +239,7 @@ void LanguageServerClient::registerEditor(SqlEditor* editor) {
 void LanguageServerClient::openDocument(SqlEditor* editor) {
     auto iterator = documents_.find(editor);
     if (iterator == documents_.end() || iterator->opened || !initialized_) return;
-    iterator->text = editor->toPlainText();
+    iterator->resetText(editor->toPlainText());
     if (iterator->isolatedMetadata) sendSqlMetadata(*iterator);
     sendNotification(QStringLiteral("textDocument/didOpen"), QJsonObject{
         {QStringLiteral("textDocument"), QJsonObject{
@@ -258,10 +278,15 @@ void LanguageServerClient::documentChanged(
     SqlEditor* editor, int position, int charsRemoved, int charsAdded) {
     auto iterator = documents_.find(editor);
     if (iterator == documents_.end()) return;
-    const QString current = editor->toPlainText();
     const int start = qBound(0, position, iterator->text.size());
     const int oldEnd = qBound(start, start + charsRemoved, iterator->text.size());
-    const QString inserted = current.mid(start, qMax(0, charsAdded));
+    const int length = editor->document()->characterCount() - 1;
+    QTextCursor changed(editor->document());
+    changed.setPosition(qMin(start, length));
+    changed.setPosition(qMin(start + charsAdded, length), QTextCursor::KeepAnchor);
+    // A full replacement (opening a package) needs no intermediate rich-text fragment.
+    const QString inserted = start == 0 && changed.selectionEnd() == length
+        ? editor->toPlainText() : changed.selection().toPlainText();
     ++iterator->version;
     if (initialized_ && iterator->opened) {
         sendNotification(QStringLiteral("textDocument/didChange"), QJsonObject{
@@ -272,8 +297,8 @@ void LanguageServerClient::documentChanged(
             {QStringLiteral("contentChanges"), QJsonArray{
                 QJsonObject{
                     {QStringLiteral("range"), QJsonObject{
-                        {QStringLiteral("start"), positionAt(iterator->text, start)},
-                        {QStringLiteral("end"), positionAt(iterator->text, oldEnd)},
+                        {QStringLiteral("start"), iterator->positionAt(start)},
+                        {QStringLiteral("end"), iterator->positionAt(oldEnd)},
                     }},
                     {QStringLiteral("text"), inserted},
                 },
@@ -281,7 +306,7 @@ void LanguageServerClient::documentChanged(
             {QStringLiteral("connectionId"), iterator->connectionId},
         });
     }
-    iterator->text = current;
+    iterator->replaceText(start, oldEnd, inserted);
 }
 
 bool LanguageServerClient::requestCompletions(SqlEditor* editor) {
@@ -294,7 +319,7 @@ bool LanguageServerClient::requestCompletions(SqlEditor* editor) {
         {QStringLiteral("textDocument"), QJsonObject{
             {QStringLiteral("uri"), iterator->uri},
         }},
-        {QStringLiteral("position"), positionAt(iterator->text, editor->textCursor().position())},
+        {QStringLiteral("position"), iterator->positionAt(editor->textCursor().position())},
     });
     for (auto pending = pendingCompletions_.begin(); pending != pendingCompletions_.end();) {
         if (pending->editor == editor) pending = pendingCompletions_.erase(pending);
@@ -322,7 +347,7 @@ bool LanguageServerClient::requestSignatureHelp(SqlEditor* editor) {
         {QStringLiteral("textDocument"), QJsonObject{
             {QStringLiteral("uri"), iterator->uri},
         }},
-        {QStringLiteral("position"), positionAt(iterator->text, editor->textCursor().position())},
+        {QStringLiteral("position"), iterator->positionAt(editor->textCursor().position())},
     });
     pendingSignatures_.insert(id, PendingCompletion{editor, iterator->version});
     return true;
@@ -369,8 +394,8 @@ bool LanguageServerClient::requestFormatting(SqlEditor* editor, int start, int e
     };
     if (range) {
         params.insert(QStringLiteral("range"), QJsonObject{
-            {QStringLiteral("start"), positionAt(iterator->text, boundedStart)},
-            {QStringLiteral("end"), positionAt(iterator->text, boundedEnd)},
+            {QStringLiteral("start"), iterator->positionAt(boundedStart)},
+            {QStringLiteral("end"), iterator->positionAt(boundedEnd)},
         });
     }
     const qint64 id = sendRequest(
@@ -394,7 +419,7 @@ bool LanguageServerClient::requestDefinition(SqlEditor* editor, bool openObjectI
     const int position = editor->textCursor().position();
     const qint64 id = sendRequest(QStringLiteral("textDocument/definition"), QJsonObject{
         {QStringLiteral("textDocument"), QJsonObject{{QStringLiteral("uri"), state->uri}}},
-        {QStringLiteral("position"), positionAt(state->text, position)},
+        {QStringLiteral("position"), state->positionAt(position)},
     });
     pendingDefinitions_.insert(id, {editor, state->version, position,
         openObjectIfMissing, editor->isVisible() || editor->hasFocus()});
@@ -498,11 +523,14 @@ void LanguageServerClient::setDefaultConnection(QString connectionId) {
     }
 }
 
-void LanguageServerClient::bindSqlEditor(SqlEditor* editor, const QString& profileId) {
+void LanguageServerClient::bindSqlEditor(SqlEditor* editor, const QString& profileId, bool invalidateExisting) {
     registerEditor(editor);
     auto state = documents_.find(editor);
     if (state == documents_.end()) return;
-    if (state->isolatedMetadata && state->profileId == profileId) return;
+    if (state->isolatedMetadata && state->profileId == profileId) {
+        if (invalidateExisting) invalidateSqlMetadata(editor);
+        return;
+    }
     state->isolatedMetadata = true;
     editor->setProperty("sqlCompletionIsolated", true);
     state->profileId = profileId;
@@ -510,16 +538,66 @@ void LanguageServerClient::bindSqlEditor(SqlEditor* editor, const QString& profi
     invalidateSqlMetadata(editor);
 }
 
+static QString sqlRelationKey(const QString& schema, const QString& name) {
+    QString key = schema + QChar(0x1f) + name;
+    // MetadataStore normalizes wire keys with to_ascii_uppercase().
+    for (QChar& c : key) {
+        if (c >= QLatin1Char('a') && c <= QLatin1Char('z')) c = c.toUpper();
+    }
+    return key;
+}
+
+static QJsonObject sqlCatalogObject(QJsonObject object) {
+    // Each SQL window loads columns through its own DPI session.
+    object.insert(QStringLiteral("columns"), QJsonArray{});
+    const QString type = object.value(QStringLiteral("objectType")).toString();
+    if (type == QStringLiteral("TABLE") || type == QStringLiteral("VIEW")
+            || type == QStringLiteral("MATERIALIZED VIEW") || type == QStringLiteral("SYNONYM")) {
+        object.insert(QStringLiteral("key"), sqlRelationKey(
+            object.value(QStringLiteral("schema")).toString(), object.value(QStringLiteral("name")).toString()));
+    }
+    // Package specs and bodies retain their distinct catalog keys.
+    return object;
+}
+
+void LanguageServerClient::sendSqlCatalogChanges(const QString& profileId, const QJsonArray& changed) {
+    if (profileId.isEmpty() || changed.isEmpty()) return;
+    QJsonArray catalog;
+    for (const auto& state : std::as_const(documents_)) {
+        if (!state.isolatedMetadata || state.profileId != profileId) continue;
+        if (catalog.isEmpty()) {
+            for (const auto& value : changed) catalog.append(sqlCatalogObject(value.toObject()));
+        }
+        if (state.objects.isEmpty()) {
+            sendSqlUpsert(state, catalog);
+            continue;
+        }
+        QJsonArray visible;
+        for (const auto& entry : std::as_const(catalog)) {
+            if (!state.objects.contains(entry.toObject().value(QStringLiteral("key")).toString()))
+                visible.append(entry);
+        }
+        if (!visible.isEmpty()) sendSqlUpsert(state, visible);
+    }
+}
+
+void LanguageServerClient::sendSqlUpsert(const DocumentState& state, const QJsonArray& objects) {
+    if (!initialized_) return;
+    sendNotification(QStringLiteral("reid/metadata/upsert"), QJsonObject{
+        {QStringLiteral("connectionId"), state.connectionId},
+        {QStringLiteral("generation"), static_cast<qint64>(state.metadataGeneration)},
+        {QStringLiteral("currentSchema"), state.currentSchema},
+        {QStringLiteral("objects"), objects},
+    });
+}
+
 void LanguageServerClient::sendSqlMetadata(const DocumentState& state) {
     if (!initialized_) return;
     QHash<QString, QJsonObject> objects;
     if (!state.profileId.isEmpty() && state.profileId == metadataConnectionId_) {
-        for (auto object : metadataObjects_) {
-            object.insert(QStringLiteral("columns"), QJsonArray{});
-            const QString key = object.value(QStringLiteral("schema")).toString()
-                + QChar(0x1f) + object.value(QStringLiteral("name")).toString();
-            object.insert(QStringLiteral("key"), key);
-            objects.insert(key, object);
+        for (const auto& value : metadataObjects_) {
+            const auto object = sqlCatalogObject(value);
+            objects.insert(object.value(QStringLiteral("key")).toString(), object);
         }
     }
     for (auto it = state.objects.cbegin(); it != state.objects.cend(); ++it) objects.insert(it.key(), it.value());
@@ -575,18 +653,19 @@ void LanguageServerClient::applySqlColumns(SqlEditor* editor, quint64 generation
         values.append(QJsonObject{{QStringLiteral("name"), column.name},
             {QStringLiteral("dataType"), type}, {QStringLiteral("nullable"), column.nullable}});
     }
-    const QString key = owner + QChar(0x1f) + table;
+    const QString key = sqlRelationKey(owner, table);
     state->objects.insert(key, QJsonObject{{QStringLiteral("key"), key},
         {QStringLiteral("schema"), owner}, {QStringLiteral("name"), table},
         {QStringLiteral("objectType"), QStringLiteral("TABLE")},
         {QStringLiteral("columns"), values}});
-    sendSqlMetadata(*state);
+    sendSqlUpsert(*state, QJsonArray{state->objects.value(key)});
     if (columns.isEmpty()) editor->showCompletionStatus(QStringLiteral("未找到可见字段，请检查对象名、Schema 和权限。"));
     else if (editor->hasFocus() && !editor->property("completionDismissed").toBool()) (void)requestCompletions(editor);
 }
 
 void LanguageServerClient::resetMetadata(const QString& connectionId, quint64 generation,
     const QString& currentSchema, const QString& databaseVersion) {
+    const QString previousProfile = metadataConnectionId_;
     metadataConnectionId_ = connectionId;
     metadataGeneration_ = generation;
     metadataCurrentSchema_ = currentSchema;
@@ -604,6 +683,11 @@ void LanguageServerClient::resetMetadata(const QString& connectionId, quint64 ge
         {QStringLiteral("compatibilityMode"), QStringLiteral("DM")},
         {QStringLiteral("objects"), QJsonArray{}},
     });
+    for (const auto& state : std::as_const(documents_)) {
+        if (state.isolatedMetadata && !state.profileId.isEmpty()
+                && (state.profileId == previousProfile || state.profileId == connectionId))
+            sendSqlMetadata(state);
+    }
 }
 
 void LanguageServerClient::upsertObjects(const QString& connectionId, quint64 generation,
@@ -628,9 +712,7 @@ void LanguageServerClient::upsertObjects(const QString& connectionId, quint64 ge
         {QStringLiteral("generation"), static_cast<qint64>(generation)},
         {QStringLiteral("objects"), values},
     });
-    for (const auto& state : documents_) {
-        if (state.isolatedMetadata && state.profileId == connectionId) sendSqlMetadata(state);
-    }
+    sendSqlCatalogChanges(connectionId, values);
 }
 
 void LanguageServerClient::upsertColumns(const QString& connectionId, quint64 generation,
@@ -639,7 +721,8 @@ void LanguageServerClient::upsertColumns(const QString& connectionId, quint64 ge
     const QString stableKey = metadataKey(key);
     pendingColumnRequests_.remove(stableKey);
     QJsonObject object = metadataObjects_.value(stableKey);
-    if (object.isEmpty()) {
+    const bool newObject = object.isEmpty();
+    if (newObject) {
         MetadataObject metadataObject;
         metadataObject.key = key;
         object = objectJson(metadataObject);
@@ -660,6 +743,7 @@ void LanguageServerClient::upsertColumns(const QString& connectionId, quint64 ge
         {QStringLiteral("generation"), static_cast<qint64>(generation)},
         {QStringLiteral("objects"), QJsonArray{object}},
     });
+    if (newObject) sendSqlCatalogChanges(connectionId, QJsonArray{object});
     const QList<SqlEditor*> editors = documents_.keys();
     for (SqlEditor* editor : editors) {
         if (editor != nullptr && editor->hasFocus() && !editor->property("completionDismissed").toBool()) {
@@ -715,11 +799,9 @@ void LanguageServerClient::upsertRoutines(const QString& connectionId, quint64 g
         {QStringLiteral("generation"), static_cast<qint64>(generation)},
         {QStringLiteral("objects"), QJsonArray{object}},
     });
+    sendSqlCatalogChanges(connectionId, QJsonArray{object});
     const QList<SqlEditor*> editors = documents_.keys();
     for (SqlEditor* editor : editors) {
-        const auto state = documents_.constFind(editor);
-        if (state != documents_.constEnd() && state->isolatedMetadata
-                && state->profileId == connectionId) sendSqlMetadata(*state);
         if (editor != nullptr && editor->hasFocus() && !editor->property("completionDismissed").toBool()) {
             if (targets.isEmpty()) editor->showCompletionStatus(QStringLiteral("未找到可见的包成员。"));
             else (void)requestCompletions(editor);
@@ -728,6 +810,15 @@ void LanguageServerClient::upsertRoutines(const QString& connectionId, quint64 g
 }
 
 void LanguageServerClient::consumeOutput() {
+    static const bool trace = qEnvironmentVariableIntValue("GZYD_PERF_TRACE") == 1;
+    QElapsedTimer timer;
+    int frames = 0;
+    qint64 bytes = 0;
+    if (trace) timer.start();
+    const auto report = qScopeGuard([&] {
+        if (trace && frames) qInfo() << "language-server read" << frames << "frames"
+                                    << bytes << "bytes" << timer.nsecsElapsed() / 1000 << "us";
+    });
     readBuffer_.append(process_->readAllStandardOutput());
     while (true) {
         const int headerEnd = readBuffer_.indexOf("\r\n\r\n");
@@ -747,6 +838,8 @@ void LanguageServerClient::consumeOutput() {
             return;
         }
         if (readBuffer_.size() < headerEnd + 4 + length) return;
+        ++frames;
+        bytes += headerEnd + 4 + length;
         const QByteArray body = readBuffer_.mid(headerEnd + 4, length);
         readBuffer_.remove(0, headerEnd + 4 + length);
         QJsonParseError error;
@@ -760,6 +853,24 @@ void LanguageServerClient::consumeOutput() {
 void LanguageServerClient::handleMessage(const QJsonObject& message) {
     if (!message.contains(QStringLiteral("id"))) {
         const QString method = message.value(QStringLiteral("method")).toString();
+        if (method == QStringLiteral("reid/metadata/rejected")) {
+            const QJsonObject params = message.value(QStringLiteral("params")).toObject();
+            const QString connectionId = params.value(QStringLiteral("connectionId")).toString();
+            const quint64 generation = static_cast<quint64>(
+                params.value(QStringLiteral("generation")).toInteger());
+            const QString reason = params.value(QStringLiteral("reason")).toString()
+                    == QStringLiteral("tooLarge")
+                ? QStringLiteral("单条元数据超过 4 MiB") : QStringLiteral("元数据格式无效");
+            for (auto state = documents_.cbegin(); state != documents_.cend(); ++state) {
+                const quint64 currentGeneration = state->isolatedMetadata
+                    ? state->metadataGeneration : metadataGeneration_;
+                if (state->connectionId == connectionId && currentGeneration == generation) {
+                    state.key()->showCompletionStatus(QStringLiteral(
+                        "%1，部分数据库补全信息未同步；本地成员解析仍可使用。").arg(reason));
+                }
+            }
+            return;
+        }
         const bool columns = method == QStringLiteral("reid/metadata/needColumns");
         const bool routines = method == QStringLiteral("reid/metadata/needRoutines");
         if (!columns && !routines) {
@@ -1067,7 +1178,8 @@ void LanguageServerClient::handleMessage(const QJsonObject& message) {
     pending.editor->applyCompletionItems(completionItems);
     if (items.isEmpty() && result.toObject().value(QStringLiteral("isIncomplete")).toBool()) {
         pending.editor->showCompletionStatus(QStringLiteral("正在加载字段信息…"));
-    } else if (items.isEmpty() && pending.editor->toPlainText().left(pending.cursorPosition).endsWith(QLatin1Char('.'))) {
+    } else if (items.isEmpty() && pending.cursorPosition > 0
+            && pending.editor->document()->characterAt(pending.cursorPosition - 1) == QLatin1Char('.')) {
         pending.editor->showCompletionStatus(QStringLiteral("未找到确定的字段，请检查当前语句的别名与查询范围。"));
     }
 }
@@ -1078,6 +1190,24 @@ void LanguageServerClient::sendNotification(const QString& method, QJsonObject p
         {QStringLiteral("method"), method},
         {QStringLiteral("params"), params},
     });
+}
+
+void LanguageServerClient::sendMetadataBatches(const QString& method, QJsonObject params,
+    const QString& field, const QJsonArray& values) {
+    const bool reset = method == QStringLiteral("reid/metadata/reset");
+    const QString batchMethod = reset ? QStringLiteral("reid/metadata/upsert") : method;
+    if (reset) {
+        params.insert(field, QJsonArray{});
+        sendNotification(method, params);
+    }
+    const qsizetype batchSize = (values.size() + 1) / 2;
+    for (qsizetype offset = 0; offset < values.size(); offset += batchSize) {
+        QJsonArray batch;
+        const auto end = qMin(offset + batchSize, values.size());
+        for (qsizetype i = offset; i < end; ++i) batch.append(values.at(i));
+        params.insert(field, batch);
+        sendNotification(batchMethod, params);
+    }
 }
 
 qint64 LanguageServerClient::sendRequest(const QString& method, QJsonObject params) {
@@ -1093,11 +1223,45 @@ qint64 LanguageServerClient::sendRequest(const QString& method, QJsonObject para
 
 void LanguageServerClient::sendMessage(QJsonObject message) {
     if (process_->state() != QProcess::Running) return;
-    const QByteArray body = QJsonDocument(message).toJson(QJsonDocument::Compact);
+    const auto method = message.value(QStringLiteral("method")).toString();
+    const bool metadata = method == QStringLiteral("reid/metadata/reset")
+        || method == QStringLiteral("reid/metadata/upsert") || method == QStringLiteral("reid/metadata/remove");
+    static const bool trace = qEnvironmentVariableIntValue("GZYD_PERF_TRACE") == 1;
+    QElapsedTimer timer;
+    if (trace && metadata) timer.start();
+    QByteArray body = QJsonDocument(message).toJson(QJsonDocument::Compact);
+    if (trace && metadata) {
+        qInfo() << "language-server metadata encode" << method << body.size()
+                << "body bytes" << timer.nsecsElapsed() / 1000 << "us";
+    }
+    if (metadata && body.size() > kMaxMetadataBytes) {
+        // The protocol limits params alone. The empty object occupies two bytes.
+        QJsonObject envelope = message;
+        envelope.insert(QStringLiteral("params"), QJsonObject{});
+        const auto overhead = QJsonDocument(envelope).toJson(QJsonDocument::Compact).size() - 2;
+        if (body.size() - overhead > kMaxMetadataBytes) {
+            auto params = message.value(QStringLiteral("params")).toObject();
+            const QString field = method == QStringLiteral("reid/metadata/remove")
+                ? QStringLiteral("keys") : QStringLiteral("objects");
+            const QJsonArray values = params.take(field).toArray();
+            if (values.size() > 1 || (method == QStringLiteral("reid/metadata/reset") && !values.isEmpty())) {
+                body.clear();
+                sendMetadataBatches(method, std::move(params), field, values);
+                return;
+            }
+            // Forward indivisible oversized notifications for explicit rejection.
+        }
+    }
     QByteArray frame = "Content-Length: ";
     frame.append(QByteArray::number(body.size()));
     frame.append("\r\n\r\n");
     frame.append(body);
+    if (trace && metadata) {
+        const auto params = message.value(QStringLiteral("params")).toObject();
+        qInfo() << "language-server metadata" << method
+                << params.value(QStringLiteral("objects")).toArray().size() << "objects"
+                << frame.size() << "frame bytes";
+    }
     process_->write(frame);
 }
 
@@ -1111,14 +1275,36 @@ void LanguageServerClient::stopProcess() {
     }
 }
 
-QJsonObject LanguageServerClient::positionAt(const QString& text, int offset) {
-    const int bounded = qBound(0, offset, text.size());
-    const int newline = bounded > 0
-        ? text.lastIndexOf(QLatin1Char('\n'), bounded - 1) : -1;
-    return QJsonObject{
-        {QStringLiteral("line"), text.left(bounded).count(QLatin1Char('\n'))},
-        {QStringLiteral("character"), bounded - newline - 1},
-    };
+void LanguageServerClient::DocumentState::resetText(QString value) {
+    text = std::move(value);
+    newlines.clear();
+    for (int i = 0; i < text.size(); ++i)
+        if (text[i] == QLatin1Char('\n')) newlines.append(i);
+}
+
+QJsonObject LanguageServerClient::DocumentState::positionAt(int offset) const {
+    offset = qBound(0, offset, text.size());
+    const auto next = std::lower_bound(newlines.cbegin(), newlines.cend(), offset);
+    const int line = static_cast<int>(next - newlines.cbegin());
+    return {{QStringLiteral("line"), line},
+            {QStringLiteral("character"), offset - (line ? newlines[line - 1] + 1 : 0)}};
+}
+
+void LanguageServerClient::DocumentState::replaceText(int start, int end, const QString& inserted) {
+    auto first = std::lower_bound(newlines.begin(), newlines.end(), start);
+    auto last = std::lower_bound(first, newlines.end(), end);
+    const int slot = static_cast<int>(first - newlines.begin());
+    newlines.erase(first, last);
+    const int delta = inserted.size() - (end - start);
+    if (delta) for (auto i = slot; i < newlines.size(); ++i) newlines[i] += delta;
+    const auto count = inserted.count(QLatin1Char('\n'));
+    if (count) {
+        newlines.insert(slot, count, 0);
+        int i = slot;
+        for (int j = 0; j < inserted.size(); ++j)
+            if (inserted[j] == QLatin1Char('\n')) newlines[i++] = start + j;
+    }
+    text.replace(start, end - start, inserted);
 }
 
 QString LanguageServerClient::metadataKey(const ObjectKey& key) {

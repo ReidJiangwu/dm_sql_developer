@@ -18,6 +18,7 @@
 #include <QVector>
 #include <QVariantMap>
 #include <memory>
+class QTextDocument;
 class QLockFile;
 struct ConnectionListMove;
 
@@ -48,7 +49,6 @@ class QCloseEvent;
 class MetadataService;
 class ObjectDropProgressDialog;
 class FindReplaceDialog;
-class UpdateDialog;
 class StartupSplash;
 class ProgramDocumentWidget;
 class ViewDocumentWidget;
@@ -142,8 +142,6 @@ private:
     void restoreNamedLayout();
     void openSettingsDialog();
     void openPrimaryToolBarSettingsDialog();
-    void showUpdateDialog(bool startupCheck = false);
-    void installUpdateFromDialog(UpdateDialog* dialog);
     void rebuildPrimaryToolBar();
     void applySettings(bool resetOutputSplit = false);
     void createMetadataService();
@@ -475,6 +473,8 @@ private:
     QList<QAction*> contextToolBarActions_;
     QList<QAction*> primaryToolBarCandidates_;
     QStringList primaryToolBarOrder_;
+    QString savedWorkspaceRoot_;
+    QHash<QString, QPair<QPointer<QTextDocument>, int>> savedWorkspaceTexts_;
     QString workspaceSessionId_;
     QPointer<StartupSplash> startupSplash_;
     bool workspaceSnapshotSaved_ = false;
@@ -490,12 +490,12 @@ private:
     QThread* metadataThread_ = nullptr;
     MetadataService* metadataService_ = nullptr;
     FindReplaceDialog* findReplaceDialog_ = nullptr;
-    QPointer<UpdateDialog> updateDialog_;
     ConnectionProfile metadataProfile_;
     ConnectionProfile pendingMetadataProfile_;
     QString failedMetadataProfileId_;
     QDateTime metadataLastHealthyAt_;
     QString metadataHealthFailure_;
+    QString metadataProbeWarning_;
     QString failedMetadataProfileName_;
     bool metadataHealthProbeInFlight_ = false;
     QByteArray pendingMetadataPassword_;

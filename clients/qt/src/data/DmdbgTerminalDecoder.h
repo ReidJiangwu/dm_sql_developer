@@ -17,12 +17,21 @@ public:
                 else text += static_cast<char>(value);
                 break;
             case State::Escape:
-                if (value == '[') state_ = State::Csi;
+                if (value == '[') { state_ = State::Csi; cursorColumns_ = 0; }
                 else if (value == ']' || value == 'P' || value == '^' || value == '_') state_ = State::String;
                 else state_ = State::Text;
                 break;
             case State::Csi:
-                if (value >= 0x40 && value <= 0x7e) state_ = State::Text;
+                if (value >= 0x40 && value <= 0x7e) {
+                    // Wine ConPTY emits cursor-forward for blanks within a line.
+                    if (value == 'C' && cursorColumns_ >= 0)
+                        text.append(QByteArray(qMax(1, cursorColumns_), ' '));
+                    state_ = State::Text;
+                } else if (value >= '0' && value <= '9' && cursorColumns_ >= 0) {
+                    cursorColumns_ = qMin(256, cursorColumns_ * 10 + value - '0');
+                } else {
+                    cursorColumns_ = -1;
+                }
                 break;
             case State::String:
                 if (value == 0x07) state_ = State::Text;
@@ -40,4 +49,5 @@ public:
 private:
     enum class State { Text, Escape, Csi, String, StringEscape };
     State state_ = State::Text;
+    int cursorColumns_ = 0;
 };

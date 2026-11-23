@@ -34,44 +34,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 include(cmake/Edition.cmake)
 
-option(REID_REQUIRE_EMBEDDED_DOWNLOAD_KEY
-    "Fail configuration when REID_DMTOOLS_DOWNLOAD_KEY is not set" OFF)
-set(REID_DOWNLOAD_KEY "$ENV{REID_DMTOOLS_DOWNLOAD_KEY}")
-if(NOT GZYD_FEATURE_internalHub)
-    set(REID_DOWNLOAD_KEY "")
-    if(REID_REQUIRE_EMBEDDED_DOWNLOAD_KEY)
-        message(FATAL_ERROR "Community builds must not require an internal download key")
-    endif()
-endif()
-if(REID_REQUIRE_EMBEDDED_DOWNLOAD_KEY AND REID_DOWNLOAD_KEY STREQUAL "")
-    message(FATAL_ERROR
-        "REID_DMTOOLS_DOWNLOAD_KEY must be set for a distributable build")
-endif()
-string(HEX "${REID_DOWNLOAD_KEY}" REID_DOWNLOAD_KEY_HEX)
-string(LENGTH "${REID_DOWNLOAD_KEY_HEX}" REID_DOWNLOAD_KEY_HEX_LENGTH)
-math(EXPR REID_DOWNLOAD_KEY_SIZE "${REID_DOWNLOAD_KEY_HEX_LENGTH} / 2")
-set(REID_DOWNLOAD_KEY_BYTES "")
-if(REID_DOWNLOAD_KEY_SIZE GREATER 0)
-    math(EXPR REID_DOWNLOAD_KEY_LAST_INDEX "${REID_DOWNLOAD_KEY_SIZE} - 1")
-    foreach(REID_DOWNLOAD_KEY_INDEX RANGE 0 ${REID_DOWNLOAD_KEY_LAST_INDEX})
-        math(EXPR REID_DOWNLOAD_KEY_HEX_INDEX "${REID_DOWNLOAD_KEY_INDEX} * 2")
-        string(SUBSTRING "${REID_DOWNLOAD_KEY_HEX}"
-            ${REID_DOWNLOAD_KEY_HEX_INDEX} 2 REID_DOWNLOAD_KEY_BYTE_HEX)
-        math(EXPR REID_DOWNLOAD_KEY_MASK
-            "(0xA7 + (${REID_DOWNLOAD_KEY_INDEX} * 73)) & 0xFF")
-        math(EXPR REID_DOWNLOAD_KEY_BYTE
-            "0x${REID_DOWNLOAD_KEY_BYTE_HEX} ^ ${REID_DOWNLOAD_KEY_MASK}")
-        string(APPEND REID_DOWNLOAD_KEY_BYTES
-            "${REID_DOWNLOAD_KEY_BYTE}, ")
-    endforeach()
-endif()
-set(REID_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
-file(MAKE_DIRECTORY "${REID_GENERATED_INCLUDE_DIR}")
-configure_file(cmake/EmbeddedDownloadKeyData.h.in
-    "${REID_GENERATED_INCLUDE_DIR}/EmbeddedDownloadKeyData.h" @ONLY)
-unset(REID_DOWNLOAD_KEY)
-unset(REID_DOWNLOAD_KEY_HEX)
-unset(REID_DOWNLOAD_KEY_BYTES)
 
 find_package(Qt6 6.4 REQUIRED COMPONENTS Concurrent Network Sql Widgets)
 set(ZLIB_USE_STATIC_LIBS ON)
@@ -170,8 +132,6 @@ qt_add_executable(GzydDmTools
     src/core/DmdbgCallBuilder.h
     src/core/EditableQuery.cpp
     src/core/EditableQuery.h
-    src/core/EmbeddedUpdateCredential.cpp
-    src/core/EmbeddedUpdateCredential.h
     src/core/DbaDiagnostics.cpp
     src/core/DbaDiagnostics.h
     src/core/DbaManagement.cpp
@@ -182,16 +142,6 @@ qt_add_executable(GzydDmTools
     src/core/RoleEditorModel.h
     src/core/TestDataGenerator.cpp
     src/core/TestDataGenerator.h
-    src/core/UpdateManifest.cpp
-    src/core/UpdateManifest.h
-    src/core/ResourceHubUpdate.cpp
-    src/core/ResourceHubUpdate.h
-    src/core/UpdateVerifier.cpp
-    src/core/UpdateVerifier.h
-    src/core/UpdateService.cpp
-    src/core/UpdateService.h
-    src/core/UpdateInstallerLauncher.cpp
-    src/core/UpdateInstallerLauncher.h
     src/core/ReleaseNotes.cpp
     src/core/ReleaseNotes.h
     src/codeintel/LanguageServerClient.cpp
@@ -307,8 +257,6 @@ qt_add_executable(GzydDmTools
     src/ui/TableCopySupport.cpp
     src/ui/TableCopySupport.h
     src/ui/DatabaseVersionPanel.h
-    src/ui/UpdateDialog.cpp
-    src/ui/UpdateDialog.h
     src/ui/ObjectDropConfirmationDialog.cpp
     src/ui/ObjectDropConfirmationDialog.h
     src/ui/PackageBodyBackupsDialog.cpp
@@ -374,7 +322,6 @@ if(MINGW)
 endif()
 add_dependencies(GzydDmTools GzydDmToolsDebugHost)
 add_dependencies(GzydDmTools GzydDmToolsCli)
-target_include_directories(GzydDmTools PRIVATE "${REID_GENERATED_INCLUDE_DIR}")
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_compile_definitions(GzydDmTools PRIVATE DM64)
 endif()
@@ -400,12 +347,6 @@ endfunction()
 set_target_properties(GzydDmTools PROPERTIES OUTPUT_NAME GzydDmTools)
 set_target_properties(GzydDmTools PROPERTIES BUILD_RPATH "${DmDpi_LIBRARY_DIR}")
 target_compile_definitions(GzydDmTools PRIVATE REID_APP_VERSION=\"${REID_APP_VERSION}\")
-set(REID_UPDATE_KEY_ID "release-2026" CACHE STRING "Trusted update signing key id")
-set(REID_UPDATE_PUBLIC_KEY_BASE64 "" CACHE STRING
-    "Base64 encoded 32-byte Ed25519 update public key")
-target_compile_definitions(GzydDmTools PRIVATE
-    REID_UPDATE_KEY_ID=\"${REID_UPDATE_KEY_ID}\"
-    REID_UPDATE_PUBLIC_KEY_BASE64=\"${REID_UPDATE_PUBLIC_KEY_BASE64}\")
 if(WIN32)
     configure_file(cmake/version.rc.in "${CMAKE_CURRENT_BINARY_DIR}/GzydDmTools-version.rc" @ONLY)
     target_sources(GzydDmTools PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/GzydDmTools-version.rc")
@@ -422,16 +363,15 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
-    set(reid_version_check_runner powershell.exe -NoProfile -ExecutionPolicy Bypass -File)
     if(REID_CROSS_RUNTIME_ROOT)
-        # CTest on the build host can discover the script itself. The cross
-        # inventory adapter supplies PowerShell when executing it on Windows.
-        set(reid_version_check_runner)
+        add_executable(wine-installer-probe "${CMAKE_CURRENT_SOURCE_DIR}/../../packaging/cross/installer-probe.cpp")
+        target_link_libraries(wine-installer-probe PRIVATE Qt6::Core user32)
     endif()
-    add_test(NAME windows.version-resources COMMAND ${reid_version_check_runner}
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../packaging/windows/test-version-resources.ps1"
-        -BinaryDirectory "$<TARGET_FILE_DIR:GzydDmTools>"
-        -ExpectedVersion "${REID_APP_VERSION}")
+    add_executable(version-resource-test tests/VersionResourceTest.cpp)
+    target_link_libraries(version-resource-test PRIVATE Qt6::Core version)
+    add_test(NAME windows.version-resources COMMAND version-resource-test
+        "$<TARGET_FILE_DIR:GzydDmTools>" "${REID_APP_VERSION}")
+    reid_configure_test_runtime(windows.version-resources)
     set_tests_properties(windows.version-resources PROPERTIES TIMEOUT 30)
     add_executable(publication-automation-test tests/PublicationAutomationTest.cpp
         src/core/ContextBootstrapTask.cpp src/core/PublicationTask.cpp src/core/CommandScript.cpp
@@ -454,10 +394,7 @@ if(BUILD_TESTING)
     add_test(NAME cli.version COMMAND GzydDmToolsCli --version)
     reid_configure_test_runtime(cli.help)
     reid_configure_test_runtime(cli.version)
-        add_executable(community-edition-test tests/CommunityEditionTest.cpp
-            src/core/EmbeddedUpdateCredential.cpp src/core/ResourceHubUpdate.cpp
-            src/core/UpdateManifest.cpp)
-        target_include_directories(community-edition-test PRIVATE "${REID_GENERATED_INCLUDE_DIR}")
+        add_executable(community-edition-test tests/CommunityEditionTest.cpp)
         target_link_libraries(community-edition-test PRIVATE Qt6::Core)
         add_test(NAME community.feature-boundary COMMAND community-edition-test)
         reid_configure_test_runtime(community.feature-boundary)
