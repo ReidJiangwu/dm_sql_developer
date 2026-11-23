@@ -46,8 +46,6 @@
 #include <QShortcut>
 #include <QElapsedTimer>
 #include "ui/Theme.h"
-#include "ui/UpdateDialog.h"
-#include "core/UpdateService.h"
 
 #include <QAction>
 #include <QApplication>
@@ -401,7 +399,7 @@ public:
         if (document.runningUnits_.isEmpty()) return false;
         document.currentSqlSource_ = document.runningUnits_.first().source;
         document.currentSqlText_ = QStringLiteral("SELECT 1 FROM DUAL;");
-        SessionError error{QStringLiteral("OutcomeUnknown"), -608,
+        SessionError error{QStringLiteral("Sql"), -608,
             QStringLiteral("session request timeout"), QStringLiteral("核对结果后再决定续发")};
         if (scenario == QStringLiteral("ordinary"))
             error = {QStringLiteral("Sql"), -2109, QStringLiteral("offline constraint failure"), {}};
@@ -412,6 +410,7 @@ public:
         } else if (scenario == QStringLiteral("connection"))
             error = {QStringLiteral("Connection"), -70025, QStringLiteral("connection not open"), {}};
         else if (scenario == QStringLiteral("batch-stop")) {
+            error = {QStringLiteral("Connection"), -70025, QStringLiteral("connection not open"), {}};
             document.parallelCoordinator_ = &coordinator;
             coordinator.parallelStopping_ = true;
         }
@@ -419,7 +418,8 @@ public:
         document.handleError(error);
         const bool noFollowupDiagnostic = scenario != QStringLiteral("local-timeout")
             || document.waitingCompileFailureDiagnostic_;
-        document.handleState(scenario == QStringLiteral("ordinary")
+        const bool retainsSession = scenario == QStringLiteral("ordinary") || scenario == QStringLiteral("request-timeout");
+        document.handleState(retainsSession
             ? SessionState::Connected : SessionState::Disconnected, error.message);
         // A parallel worker routes its visible log to the coordinator. Check
         // the real output owner, while retaining the worker state assertions.
@@ -429,7 +429,7 @@ public:
             && !output.contains(QStringLiteral("错误 0"))
             && !output.contains(QStringLiteral("致命会话错误"))
             && !document.publishReconnectTimer_->isActive();
-        if (scenario == QStringLiteral("ordinary")) {
+        if (retainsSession) {
             passed &= document.isConnected() && !document.runningUnits_.isEmpty()
                 && !document.fatalSessionStopped_ && !document.transactionOutcomeUnknown_;
         } else {
@@ -984,6 +984,20 @@ public:
         host.resize(1000, 700);
         host.show();
         QApplication::processEvents();
+        if (scenario == QStringLiteral("rollover")) {
+            const QString line = QString(255, QChar(0x6C49)) + QLatin1Char('\n');
+            const QString chunk = line.repeated(1024);
+            for (int i = 0; i < 10; ++i) document->appendOutput(chunk);
+            document->appendOutput(QStringLiteral("retained witness\ntail"));
+            auto* log = document->output_->document();
+            auto witness = log->find(QStringLiteral("retained witness"));
+            document->outputTabs_->setCurrentIndex(1);
+            for (int i = 0; i < 3; ++i) document->appendOutput(chunk);
+            document->outputTabs_->setCurrentIndex(0);
+            return witness.selectedText() == QStringLiteral("retained witness")
+                && log->firstBlock().text() == QStringLiteral("[较早输出已截断]")
+                && document->outputBytes_ <= 8 * 1024 * 1024;
+        }
         QStringList lines;
         for (int index = 0; index < 300; ++index)
             lines.append(QStringLiteral("offline publish log %1").arg(index));
@@ -1570,6 +1584,19 @@ public:
         }
         if (scenario == QStringLiteral("barriers")) {
             const QString prefix = QStringLiteral("@@ file0.cre;\n@@ file1.cre;\n");
+            if (!write(QStringLiteral("first.svc"), QStringLiteral("PROMPT first\n"))
+                    || !write(QStringLiteral("second.svc"), QStringLiteral("PROMPT second\n"))
+                    || !write(QStringLiteral("projection.SVC"), QStringLiteral(
+                        "DECLARE p VARCHAR2(10) := 'Case';\nBEGIN\n"
+                        "Fnd_Projection_API.Create_Or_Replace(p);\nEND;\n/\n"))) return false;
+            const auto svcUnits = CommandScript::parse(QStringLiteral(
+                "@@ first.svc;\n@@ second.svc;\n@@ projection.SVC;\n@@ first.svc;\n"), source);
+            const auto beforeRegistration = CommandParallelPlan::collect(svcUnits, fixture.path(), variables, true);
+            const auto registration = CommandParallelPlan::collect(svcUnits.mid(2), fixture.path(), variables, true);
+            check(beforeRegistration.files.size() == 2 && beforeRegistration.consumedUnits == 2
+                && registration.files.isEmpty() && registration.consumedUnits == 0
+                && registration.barrier.contains(QStringLiteral("投影元数据")),
+                "COMMAND_NESTED_PARALLEL_ISOLATES_PROJECTION_REGISTRATION");
             const QStringList barriers{QStringLiteral("DEFINE OWNER = other\n"), QStringLiteral("SET DEFINE OFF\n"),
                 QStringLiteral("BEGIN NULL; END;\n/\n"), QStringLiteral("SPOOL output.txt\n"),
                 QStringLiteral("WHENEVER SQLERROR EXIT\n"), QStringLiteral("ACCEPT P\n")};
@@ -3522,10 +3549,6 @@ int main(int argc, char* argv[]) {
         arguments.contains(QStringLiteral("--self-test-command-source-navigation"));
     const bool findReplaceSmokeTest =
         arguments.contains(QStringLiteral("--self-test-find-replace"));
-    const bool updateDialogSmokeTest =
-        arguments.contains(QStringLiteral("--self-test-update-dialog"));
-    const bool macosWineUpdateSelfTest =
-        arguments.contains(QStringLiteral("--self-test-macos-wine-update"));
     const bool databaseEnvironmentUiSelfTest =
         arguments.contains(QStringLiteral("--self-test-database-environment-ui"));
     const bool communityEditionTest = arguments.contains(QStringLiteral("--self-test-community-edition"));
@@ -3537,7 +3560,7 @@ int main(int argc, char* argv[]) {
         || batchCloseSelfTest
         || debugUiSelfTest || testWindowRefreshSmokeTest || invalidTestTargetsSmokeTest
         || testReconnectArgumentsSelfTest || erpWorkbenchSmokeTest || lobbyPreviewWorkbenchTest || lobbyPageDesignerTest || lobbyPageGroupsTest || lobbyStableDragTest || lobbyColorsTest || lobbyWindowsTest || lobbyPageRefreshTest || lobbySeparatorsTest || lobbyReadonlyTest || lobbyElementTypeIconsTest || commandSourceNavigationSmokeTest
-        || findReplaceSmokeTest || updateDialogSmokeTest || macosWineUpdateSelfTest;
+        || findReplaceSmokeTest;
     QScopedPointer<QTemporaryDir> snippetDockSettings;
     if (objectEditorDropSelfTest || communityEditionTest || workspaceHistorySelfTest || snippetDockSelfTest || navigationViewsSelfTest || applicationDisconnectSelfTest || applicationRoleSwitchSelfTest || lobbyPageGroupsTest || lobbyStableDragTest || lobbyColorsTest || lobbyWindowsTest || lobbyPageRefreshTest || lobbySeparatorsTest || lobbyReadonlyTest || lobbyElementTypeIconsTest) {
         snippetDockSettings.reset(new QTemporaryDir);
@@ -3791,93 +3814,6 @@ int main(int argc, char* argv[]) {
                           : "FIND_REPLACE_QT_SELF_TEST=FAIL\n");
         return passed ? 0 : 1;
     }
-    if (macosWineUpdateSelfTest) {
-        qputenv("REID_MACOS_WINE", "1");
-        QPointer<UpdateDialog> dialog = new UpdateDialog;
-        auto* channel = dialog->findChild<QLabel*>(QStringLiteral("updateChannelLabel"));
-        auto* check = dialog->findChild<QPushButton*>(QStringLiteral("checkUpdateButton"));
-        auto* install = dialog->findChild<QPushButton*>(QStringLiteral("installUpdateButton"));
-        auto* advanced = dialog->findChild<QToolButton*>(QStringLiteral("updateAdvancedToggle"));
-        bool passed = channel && channel->text() == QStringLiteral("Mac｜PKG 安装包")
-            && check && check->text() == QStringLiteral("打开资源中心")
-            && install && install->isHidden() && advanced && advanced->isHidden();
-        auto* updateService = dialog->findChild<reid::update::UpdateService*>();
-        passed &= updateService != nullptr;
-        if (updateService && check && advanced && install) {
-            emit updateService->operationFailed(QStringLiteral("Fixture service unavailable"));
-            passed &= check->text() == QStringLiteral("打开资源中心")
-                && advanced->isHidden() && install->isHidden();
-        }
-        dialog->beginStartupCheck();
-        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
-        passed = passed && dialog.isNull();
-        delete dialog.data();
-        QTextStream(passed ? stdout : stderr) << (passed ? "MACOS_WINE_UPDATE=PASS\n" : "MACOS_WINE_UPDATE=FAIL\n");
-        return passed ? 0 : 1;
-    }
-
-    if (updateDialogSmokeTest) {
-        UpdateDialog dialog;
-        auto* statusPanel = dialog.findChild<QWidget*>(
-            QStringLiteral("updateStatusPanel"));
-        auto* versionPanel = dialog.findChild<QWidget*>(
-            QStringLiteral("updateVersionPanel"));
-        auto* channel = dialog.findChild<QLabel*>(
-            QStringLiteral("updateChannelLabel"));
-        auto* actionBar = dialog.findChild<QWidget*>(
-            QStringLiteral("updateActionBar"));
-        auto* title = dialog.findChild<QLabel*>(
-            QStringLiteral("updateStatusTitle"));
-        auto* advancedToggle = dialog.findChild<QToolButton*>(
-            QStringLiteral("updateAdvancedToggle"));
-        auto* advancedPanel = dialog.findChild<QWidget*>(
-            QStringLiteral("updateAdvancedPanel"));
-        auto* progress = dialog.findChild<QProgressBar*>(
-            QStringLiteral("updateProgressBar"));
-        auto* check = dialog.findChild<QPushButton*>(
-            QStringLiteral("checkUpdateButton"));
-        auto* download = dialog.findChild<QPushButton*>(
-            QStringLiteral("downloadUpdateButton"));
-        auto* install = dialog.findChild<QPushButton*>(
-            QStringLiteral("installUpdateButton"));
-        auto* cancel = dialog.findChild<QPushButton*>(
-            QStringLiteral("cancelUpdateButton"));
-        auto* close = dialog.findChild<QPushButton*>(
-            QStringLiteral("closeUpdateButton"));
-        auto* source = dialog.findChild<QLineEdit*>(QStringLiteral("updateSourceEdit"));
-        bool passed = statusPanel != nullptr && versionPanel != nullptr
-            && channel != nullptr && actionBar != nullptr && title != nullptr
-            && advancedToggle != nullptr && advancedPanel != nullptr
-            && progress != nullptr && check != nullptr && download != nullptr
-            && install != nullptr
-            && cancel != nullptr && close != nullptr && source != nullptr
-            && statusPanel->property("statusKind").toString() == QStringLiteral("info")
-            && dialog.width() == 540 && dialog.minimumWidth() == 480
-            && dialog.maximumWidth() > 540 && dialog.height() < 310
-            && check->property("role").toString() == QStringLiteral("primary")
-            && close->property("quietAction").toBool() && !close->autoDefault()
-            && channel->text() == QStringLiteral("Windows x64｜内部正式通道")
-            && title->text() == QStringLiteral("准备检查更新")
-            && advancedPanel->isHidden() && progress->isHidden()
-            && !check->isHidden() && download->isHidden() && install->isHidden()
-            && cancel->isHidden();
-        if (passed) {
-            const int collapsedHeight = dialog.height();
-            dialog.resize(640, collapsedHeight);
-            advancedToggle->click();
-            passed = !advancedPanel->isHidden()
-                && advancedToggle->arrowType() == Qt::DownArrow
-                && dialog.width() == 640 && dialog.height() > collapsedHeight;
-            advancedToggle->click();
-            passed = passed && advancedPanel->isHidden()
-                && advancedToggle->arrowType() == Qt::RightArrow
-                && dialog.width() == 640 && dialog.height() == collapsedHeight;
-        }
-        QTextStream stream(passed ? stdout : stderr);
-        stream << (passed ? "UPDATE_DIALOG_QT_SELF_TEST=PASS\n"
-                          : "UPDATE_DIALOG_QT_SELF_TEST=FAIL\n");
-        return passed ? 0 : 1;
-    }
     QScopedPointer<StartupSplash> splash(
         smokeTest ? nullptr : createSplash());
     MainWindow window(nullptr, !smokeTest,
@@ -3905,6 +3841,9 @@ int main(int argc, char* argv[]) {
     if (communityEditionTest) {
         QTimer::singleShot(0, &application, [&window] {
             const bool passed = !ProductFeatures::erp && !ProductFeatures::internalHub
+                && window.findChild<QAction*>(QStringLiteral("versionNotesAction"))
+                && !window.findChild<QAction*>(QStringLiteral("usageStatisticsAction"))
+                && !window.findChild<QAction*>(QStringLiteral("checkUpdateAction"))
                 && !window.findChild<QMenu*>(QStringLiteral("projectionQueryMenu"))
                 && !window.findChild<QMenu*>(QStringLiteral("lobbyManagementMenu"))
                 && !QFile::exists(QStringLiteral(":/sql/lobby-datasource.sql"));

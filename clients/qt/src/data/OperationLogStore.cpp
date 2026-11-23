@@ -22,10 +22,6 @@ namespace {
 constexpr int kDefaultMaxLength = 2048;
 constexpr int kMaxRows = 10'000;
 
-void sanitizeCredentialLike(QString& text, const QRegularExpression& regex, const QString& mask) {
-    text = text.replace(regex, mask);
-}
-
 }  // namespace
 
 OperationLogStore::OperationLogStore(QString path)
@@ -78,7 +74,7 @@ bool OperationLogStore::append(const OperationLogRecord& record, QString* error)
     query.bindValue(QStringLiteral(":rows"), record.rows);
     query.bindValue(QStringLiteral(":success"), record.success ? 1 : 0);
     query.bindValue(QStringLiteral(":error_code"), record.errorCode);
-    query.bindValue(QStringLiteral(":error"), nonNull(sanitizeSql(record.error)));
+    query.bindValue(QStringLiteral(":error"), nonNull(sanitizeSql(record.error, kDefaultMaxLength)));
     query.bindValue(QStringLiteral(":sql"), nonNull(sanitizeSql(record.sql)));
     const bool ok = query.exec();
     if (!ok && error != nullptr) {
@@ -187,24 +183,32 @@ QString OperationLogStore::defaultPath() {
 
 QString OperationLogStore::sanitizeSql(const QString& sql, int maxLength) {
     QString output = sql;
-    const QRegularExpression userManagement(QStringLiteral("(?is)^\\s*(create|alter)\\s+user\\b"));
-    const QRegularExpressionMatch userMatch = userManagement.match(output);
-    if (userMatch.hasMatch()) {
-        return QStringLiteral("[敏感 SQL 已隐藏：%1 USER]")
-            .arg(userMatch.captured(1).toUpper());
+    // Keep the statement and its formatting; replace only inline credential values.
+    static const QString gap = QStringLiteral(R"((?:\s++|/\*[\s\S]*?\*/|--[^\r\n]*)*)");
+    static const QString value = QStringLiteral(R"sql((?:'(?:''|[^'])*+(?:'|\z)|"(?:""|[^"])*+(?:"|\z)|[^\s;,)'"]+))sql");
+    static const QRegularExpression identified(QStringLiteral("(?i)(\\bidentified\\b%1\\bby\\b%1)%2"
+        "(?:(%1\\breplace\\b%1)%2)?").arg(gap, value));
+    static const QRegularExpression assigned(QStringLiteral(
+        "(?i)(\\b(?:password|passwd|pwd|token|secret|apikey|api_key)\\b%1=%1)%2").arg(gap, value));
+    static const QRegularExpression setPassword(QStringLiteral(
+        "(?i)(\\bset\\b%1\\bpassword\\b%1(?:=%1)?)%2").arg(gap, value));
+    // REPLACE may introduce the previous password in an ALTER USER statement.
+    QString masked;
+    qsizetype copied = 0;
+    auto matches = identified.globalMatch(output);
+    while (matches.hasNext()) {
+        const auto match = matches.next();
+        masked += QStringView(output).mid(copied, match.capturedStart() - copied);
+        masked += match.captured(1) + QStringLiteral("***");
+        if (match.capturedStart(2) >= 0) masked += match.captured(2) + QStringLiteral("***");
+        copied = match.capturedEnd();
     }
-    sanitizeCredentialLike(output,
-        QRegularExpression(QStringLiteral(
-            "(?i)(password|passwd|pwd)\\s*=\\s*'[^']*'")),
-        QStringLiteral("$1=***"));
-    sanitizeCredentialLike(output,
-        QRegularExpression(QStringLiteral(
-            "(?i)(token|secret|apikey|api_key)\\s*=\\s*'[^']*'")),
-        QStringLiteral("$1=***"));
-    sanitizeCredentialLike(output,
-        QRegularExpression(QStringLiteral(
-            "(?i)(identified\\s+by|set\\s+password)\\s+('[^']*'|\"[^\"]*\"|[^\\s;]+)")),
-        QStringLiteral("$1 ***"));
+    if (copied) {
+        masked += QStringView(output).mid(copied);
+        output = std::move(masked);
+    }
+    output.replace(assigned, QStringLiteral("\\1***"));
+    output.replace(setPassword, QStringLiteral("\\1***"));
     if (output.length() > maxLength && maxLength > 0) {
         output.truncate(maxLength);
     }

@@ -154,6 +154,35 @@ QString objectNavigationModifierName() {
 #endif
 }
 
+// Also accept a double-click selection that leaves both quotes outside the selection.
+QString keywordReplacement(QTextCursor& cursor) {
+    if (!cursor.hasSelection() || cursor.selectionStart() < cursor.block().position()
+            || cursor.selectionEnd() > cursor.block().position() + cursor.block().length() - 1)
+        return {};
+    const int start = cursor.selectionStart();
+    const int end = cursor.selectionEnd();
+    const auto* document = cursor.document();
+    const QChar quote = QLatin1Char('"');
+    QString name = cursor.selectedText();
+    const bool includesQuotes = name.size() >= 2 && name.front() == quote && name.back() == quote;
+    const QChar before = start > 0 ? document->characterAt(start - 1) : QChar();
+    const QChar after = document->characterAt(end);
+    const bool insideQuotes = before == quote && after == quote;
+    if (includesQuotes) name = name.mid(1, name.size() - 2);
+    static const QRegularExpression identifier(QStringLiteral(R"(\A[\p{L}_][\p{L}\p{M}\p{N}_$#]*\z)"));
+    if (!identifier.match(name).hasMatch()) return {};
+    if (insideQuotes && !includesQuotes) {
+        cursor.setPosition(start - 1);
+        cursor.setPosition(end + 1, QTextCursor::KeepAnchor);
+    }
+    const auto touchesName = [quote](QChar c) {
+        return c.isLetterOrNumber() || c.isMark() || c == quote || c == u'_' || c == u'$' || c == u'#';
+    };
+    if ((cursor.selectionStart() > 0 && touchesName(document->characterAt(cursor.selectionStart() - 1)))
+            || touchesName(document->characterAt(cursor.selectionEnd()))) return {};
+    return includesQuotes || insideQuotes ? name : quote + name.toUpper() + quote;
+}
+
 }  // namespace
 
 class SqlSyntaxHighlighter final : public QSyntaxHighlighter {
@@ -214,23 +243,27 @@ protected:
             "AUTHID|CURRENT_USER|DEFINER|SUBTYPE|RESULT_CACHE|DETERMINISTIC|PIPELINED|NOCOPY)"
             "(?![A-Za-z0-9_$#])"),
             QRegularExpression::CaseInsensitiveOption);
-        if (settings_.keywords.enabled) {
-            applyMatches(text, keywords, keyword_);
-        }
-        if (settings_.numbers.enabled) {
-            static const QRegularExpression numbers(QStringLiteral(
-                "(?<![A-Za-z0-9_$#])(?:0[xX][0-9A-Fa-f]+|(?:\\d+(?:\\.\\d*)?|\\.\\d+)"
-                "(?:[eE][+-]?\\d+)?)(?![A-Za-z0-9_$#])"));
-            applyMatches(text, numbers, number_);
-        }
-        if (settings_.symbols.enabled) {
-            static const QRegularExpression symbols(QStringLiteral(
-                "[+\\-*/%=<>!|&^~:;,.()\\[\\]{}]"));
-            applyMatches(text, symbols, symbol_);
-        }
-        if (settings_.custom.enabled && !settings_.customKeywords.isEmpty()) {
-            applyMatches(text, customKeywords_, custom_);
-        }
+        const auto highlightCode = [&](int start, int end) {
+            if (start >= end) return;
+            const auto code = QStringView(text).sliced(start, end - start);
+            if (settings_.keywords.enabled) {
+                applyMatches(code, start, keywords, keyword_);
+            }
+            if (settings_.numbers.enabled) {
+                static const QRegularExpression numbers(QStringLiteral(
+                    "(?<![A-Za-z0-9_$#])(?:0[xX][0-9A-Fa-f]+|(?:\\d+(?:\\.\\d*)?|\\.\\d+)"
+                    "(?:[eE][+-]?\\d+)?)(?![A-Za-z0-9_$#])"));
+                applyMatches(code, start, numbers, number_);
+            }
+            if (settings_.symbols.enabled) {
+                static const QRegularExpression symbols(QStringLiteral(
+                    "[+\\-*/%=<>!|&^~:;,.()\\[\\]{}]"));
+                applyMatches(code, start, symbols, symbol_);
+            }
+            if (settings_.custom.enabled && !settings_.customKeywords.isEmpty()) {
+                applyMatches(code, start, customKeywords_, custom_);
+            }
+        };
 
         const QTextCharFormat plain;
         int index = 0;
@@ -248,8 +281,10 @@ protected:
             setFormat(0, end + 2, settings_.comments.enabled ? comment_ : plain);
             index = end + 2;
         }
+        int codeStart = index;
         while (index < text.size()) {
             if (!inString && (inIdentifier || text.at(index) == QLatin1Char('"'))) {
+                highlightCode(codeStart, index);
                 const int start = index;
                 if (!inIdentifier) ++index;
                 inIdentifier = true;
@@ -265,9 +300,11 @@ protected:
                 }
                 setFormat(start, index - start, plain);
                 if (inIdentifier) setCurrentBlockState(3);
+                codeStart = index;
                 continue;
             }
             if (inString || text.at(index) == QLatin1Char('\'')) {
+                highlightCode(codeStart, index);
                 const int start = index;
                 if (!inString) ++index;
                 inString = true;
@@ -286,28 +323,33 @@ protected:
                 }
                 setFormat(start, index - start, settings_.strings.enabled ? string_ : plain);
                 if (inString) setCurrentBlockState(2);
+                codeStart = index;
                 continue;
             }
-            if (text.mid(index, 2) == QStringLiteral("--")) {
+            if (text[index] == QLatin1Char('-') && index + 1 < text.size() && text[index + 1] == QLatin1Char('-')) {
+                highlightCode(codeStart, index);
                 setFormat(index, text.size() - index,
                     settings_.comments.enabled ? comment_ : plain);
-                break;
+                return;
             }
-            if (text.mid(index, 2) == QStringLiteral("/*")) {
+            if (text[index] == QLatin1Char('/') && index + 1 < text.size() && text[index + 1] == QLatin1Char('*')) {
+                highlightCode(codeStart, index);
                 const int end = text.indexOf(QStringLiteral("*/"), index + 2);
                 if (end < 0) {
                     setFormat(index, text.size() - index,
                         settings_.comments.enabled ? comment_ : plain);
                     setCurrentBlockState(1);
-                    break;
+                    return;
                 }
                 setFormat(index, end + 2 - index,
                     settings_.comments.enabled ? comment_ : plain);
                 index = end + 2;
+                codeStart = index;
                 continue;
             }
             ++index;
         }
+        highlightCode(codeStart, index);
     }
 
 private:
@@ -318,12 +360,12 @@ private:
         format.setFontItalic(style.italic);
     }
 
-    void applyMatches(const QString& text, const QRegularExpression& expression,
+    void applyMatches(QStringView text, int start, const QRegularExpression& expression,
             const QTextCharFormat& format) {
-        auto iterator = expression.globalMatch(text);
+        auto iterator = expression.globalMatchView(text);
         while (iterator.hasNext()) {
             const auto match = iterator.next();
-            setFormat(match.capturedStart(), match.capturedLength(), format);
+            setFormat(start + match.capturedStart(), match.capturedLength(), format);
         }
     }
 
@@ -808,6 +850,19 @@ void SqlEditor::contextMenuEvent(QContextMenuEvent* event) {
         });
     }
     menu->addSeparator();
+    auto* keyword = menu->addAction(QStringLiteral("@关键字"));
+    keyword->setObjectName(QStringLiteral("toggleKeywordQuotes"));
+    auto selected = textCursor();
+    keyword->setEnabled(!isReadOnly() && !keywordReplacement(selected).isEmpty());
+    connect(keyword, &QAction::triggered, this, [this] {
+        auto cursor = textCursor();
+        const QString replacement = keywordReplacement(cursor);
+        if (isReadOnly() || replacement.isEmpty()) return;
+        const int start = cursor.selectionStart();
+        cursor.insertText(replacement);
+        cursor.setPosition(start, QTextCursor::KeepAnchor);
+        setTextCursor(cursor);
+    });
     QAction* comment = menu->addAction(QStringLiteral("注释选区"));
     comment->setToolTip(QStringLiteral("使用 /* 和 */ 注释当前选区"));
     comment->setEnabled(canCommentSelection());
@@ -1169,80 +1224,70 @@ void SqlEditor::handleLineNumberClick(int y) {
 }
 
 QList<QTextEdit::ExtraSelection> SqlEditor::bracketSelections() const {
-    const QString text = toPlainText();
-    int position = textCursor().position();
-    int bracket = -1;
-    if (position < text.size() && QStringLiteral("()[]{}").contains(text[position])) bracket = position;
-    else if (position > 0 && QStringLiteral("()[]{}").contains(text[position - 1])) bracket = position - 1;
+    const int position = textCursor().position();
+    const QString brackets = QStringLiteral("()[]{}");
+    const int bracket = brackets.contains(document()->characterAt(position)) ? position
+        : position > 0 && brackets.contains(document()->characterAt(position - 1)) ? position - 1 : -1;
     if (bracket < 0) return {};
-
-    QVector<int> codeBrackets;
-    bool singleQuote = false;
-    bool quotedIdentifier = false;
-    bool lineComment = false;
-    bool blockComment = false;
-    for (int index = 0; index < text.size(); ++index) {
-        const QChar current = text[index];
-        const QChar next = index + 1 < text.size() ? text[index + 1] : QChar();
-        if (lineComment) {
-            if (current == QLatin1Char('\n')) lineComment = false;
-            continue;
-        }
-        if (blockComment) {
-            if (current == QLatin1Char('*') && next == QLatin1Char('/')) {
-                blockComment = false;
-                ++index;
+    if (bracketRevision_ != document()->revision()) {
+        bracketRevision_ = document()->revision();
+        bracketPartners_.clear();
+        QVector<int> stacks[3];
+        const QString text = toPlainText();
+        bool singleQuote = false;
+        bool quotedIdentifier = false;
+        bool lineComment = false;
+        bool blockComment = false;
+        for (int index = 0; index < text.size(); ++index) {
+            const QChar current = text[index];
+            const QChar next = index + 1 < text.size() ? text[index + 1] : QChar();
+            if (lineComment) {
+                if (current == QLatin1Char('\n')) lineComment = false;
+                continue;
             }
-            continue;
-        }
-        if (singleQuote) {
-            if (current == QLatin1Char('\'') && next == QLatin1Char('\'')) ++index;
-            else if (current == QLatin1Char('\'')) singleQuote = false;
-            continue;
-        }
-        if (quotedIdentifier) {
-            if (current == QLatin1Char('"') && next == QLatin1Char('"')) ++index;
-            else if (current == QLatin1Char('"')) quotedIdentifier = false;
-            continue;
-        }
-        if (current == QLatin1Char('-') && next == QLatin1Char('-')) {
-            lineComment = true;
-            ++index;
-        } else if (current == QLatin1Char('/') && next == QLatin1Char('*')) {
-            blockComment = true;
-            ++index;
-        } else if (current == QLatin1Char('\'')) {
-            singleQuote = true;
-        } else if (current == QLatin1Char('"')) {
-            quotedIdentifier = true;
-        } else if (QStringLiteral("()[]{}").contains(current)) {
-            codeBrackets.append(index);
-        }
-    }
-    const int bracketListIndex = codeBrackets.indexOf(bracket);
-    if (bracketListIndex < 0) return {};
-
-    const QChar value = text[bracket];
-    const QString opens = QStringLiteral("([{ ").trimmed();
-    const QString closes = QStringLiteral(")]}");
-    const int openIndex = opens.indexOf(value);
-    const int closeIndex = closes.indexOf(value);
-    const bool forward = openIndex >= 0;
-    const QChar open = forward ? value : opens[closeIndex];
-    const QChar close = forward ? closes[openIndex] : value;
-    int depth = 0;
-    int match = -1;
-    for (int listIndex = bracketListIndex;
-         forward ? listIndex < codeBrackets.size() : listIndex >= 0;
-         listIndex += forward ? 1 : -1) {
-        const int index = codeBrackets[listIndex];
-        const QChar current = text[index];
-        if (current == (forward ? open : close)) ++depth;
-        else if (current == (forward ? close : open) && --depth == 0) {
-            match = index;
-            break;
+            if (blockComment) {
+                if (current == QLatin1Char('*') && next == QLatin1Char('/')) {
+                    blockComment = false;
+                    ++index;
+                }
+                continue;
+            }
+            if (singleQuote) {
+                if (current == QLatin1Char('\'') && next == QLatin1Char('\'')) ++index;
+                else if (current == QLatin1Char('\'')) singleQuote = false;
+                continue;
+            }
+            if (quotedIdentifier) {
+                if (current == QLatin1Char('"') && next == QLatin1Char('"')) ++index;
+                else if (current == QLatin1Char('"')) quotedIdentifier = false;
+                continue;
+            }
+            if (current == QLatin1Char('-') && next == QLatin1Char('-')) {
+                lineComment = true;
+                ++index;
+            } else if (current == QLatin1Char('/') && next == QLatin1Char('*')) {
+                blockComment = true;
+                ++index;
+            } else if (current == QLatin1Char('\'')) {
+                singleQuote = true;
+            } else if (current == QLatin1Char('"')) {
+                quotedIdentifier = true;
+            } else if (QStringLiteral("()[]{}").contains(current)) {
+                const int opening = QStringLiteral("([{").indexOf(current);
+                if (opening >= 0) {
+                    stacks[opening].append(index);
+                } else {
+                    auto& stack = stacks[QStringLiteral(")]}").indexOf(current)];
+                    if (!stack.isEmpty()) {
+                        const int other = stack.takeLast();
+                        bracketPartners_.insert(index, other);
+                        bracketPartners_.insert(other, index);
+                    }
+                }
+            }
         }
     }
+    const int match = bracketPartners_.value(bracket, -1);
     if (match < 0) return {};
     QList<QTextEdit::ExtraSelection> selections;
     for (int index : {bracket, match}) {

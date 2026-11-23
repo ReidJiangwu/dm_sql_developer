@@ -390,7 +390,11 @@ void OperationLogPanel::appendRecord(const OperationLogRecord& record) {
         }
         return;
     }
-    appendRecordRow(record);
+    auto displayRecord = record;
+    displayRecord.sql = OperationLogStore::sanitizeSql(record.sql);
+    displayRecord.error = OperationLogStore::sanitizeSql(record.error, 2048);
+    records_.append(displayRecord);
+    appendRecordRow(displayRecord);
     if (statusLabel_ != nullptr) {
         statusLabel_->setText(QStringLiteral("操作日志持久化失败：%1").arg(error));
     }

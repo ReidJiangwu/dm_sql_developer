@@ -995,12 +995,13 @@ void DpiSession::reportOperationTimeout(const QString& operation, int timeoutSec
         QStringLiteral("重新连接后先核对原会话和对象状态，不要直接重试 DDL、提交或回滚；"
                        "如该操作需要长时间运行，请核对相应超时配置。"),
     };
-    error.technical = QStringLiteral("failureOrigin=client-wait-timeout; timeoutSeconds=%1")
+    error.technical = QStringLiteral("failureOrigin=client-wait-timeout; sessionAction=disconnect; timeoutSeconds=%1")
         .arg(timeoutSeconds);
     stampErrorIdentity(&error);
+    emit diagnosticTrace(QStringLiteral("本地等待超时：executionId=%1；%2").arg(executionId_).arg(error.technical));
     clearConnection(false);
     emit stateChanged(SessionState::Failed, QStringLiteral("失败：%1").arg(error.message));
-    emitExecutionFinished(false, error.code, error.message, planMode_);
+    emitExecutionFinished(false, error.code, error.message, planMode_, false, error.technical);
     emit failed(error);
     emit transactionStateChanged(false);
     emit message(QStringLiteral(
@@ -1193,10 +1194,7 @@ QString DpiSession::scriptOutputControlSql(bool enabled) {
 }
 
 bool DpiSession::indicatesBrokenConnection(const SessionError& error) {
-    return error.code == -70025
-        || error.message.contains(QStringLiteral("连接未打开"), Qt::CaseInsensitive)
-        || error.message.contains(QStringLiteral("connection is not open"), Qt::CaseInsensitive)
-        || error.message.contains(QStringLiteral("connection not open"), Qt::CaseInsensitive);
+    return ConnectionFailure::indicatesBrokenConnection(error);
 }
 
 bool DpiSession::indicatesExecutionTimeout(const SessionError& error) {
@@ -1948,7 +1946,7 @@ void DpiSession::executeInternal(
         clearStatement();
         if (validateConnection()) {
             updateTransactionStateAfterExecution(false);
-            emitExecutionFinished(false, 0, QStringLiteral("当前 SQL 已取消。"), false);
+            emitExecutionFinished(false, 0, QStringLiteral("当前 SQL 已取消。"), false, true);
             emit stateChanged(SessionState::Connected, QStringLiteral("已取消，连接可继续使用"));
             emit message(QStringLiteral("当前 SQL 已取消。"));
         } else {
@@ -2332,7 +2330,7 @@ void DpiSession::fetchBatch(qint64 elapsedMs) {
             const DPIRETURN cancelResult = dpi_cancel(statement_);
             clearStatement();
             if (DSQL_SUCCEEDED(cancelResult) && validateConnection()) {
-                emitExecutionFinished(false, 0, QStringLiteral("结果获取已取消。"), false);
+                emitExecutionFinished(false, 0, QStringLiteral("结果获取已取消。"), false, true);
                 emit stateChanged(SessionState::Connected, QStringLiteral("获取结果已取消"));
                 emit message(QStringLiteral("结果获取已取消。"));
             } else {
@@ -2473,7 +2471,7 @@ void DpiSession::advanceResult(qint64 elapsedMs) {
         clearStatement();
         if (validateConnection()) {
             updateTransactionStateAfterExecution(false);
-            emitExecutionFinished(false, 0, QStringLiteral("当前执行已取消。"), false);
+            emitExecutionFinished(false, 0, QStringLiteral("当前执行已取消。"), false, true);
             emit stateChanged(SessionState::Connected, QStringLiteral("已取消，连接可继续使用"));
             emit message(QStringLiteral("当前 SQL 已取消。"));
         } else {
@@ -2866,7 +2864,7 @@ void DpiSession::exportQuery(QString sql, QString path, ExportFormat format, QSt
     qint64 rows = 0;
     if (!exportQuery(EditableQuery::withoutForUpdate(sql), path, format, targetTable, &rows, &error)) {
         emit exportFailed(error);
-        if (connectionIsBroken(error) || indicatesExecutionTimeout(error)) {
+        if (connectionIsBroken(error)) {
             reportBrokenConnection(error);
         } else {
             emit stateChanged(connected_ ? SessionState::Connected : SessionState::Disconnected,
@@ -4090,16 +4088,17 @@ void DpiSession::updateTransactionStateAfterExecution(bool success) {
 }
 
 void DpiSession::emitExecutionFinished(bool success, int errorCode,
-    const QString& error, bool isPlan) {
+    const QString& error, bool isPlan, bool cancelled, const QString& failureDetail) {
     if (!executionInProgress_ || executionSummaryEmitted_) {
         return;
     }
     executionSummaryEmitted_ = true;
     executionInProgress_ = false;
     const qint64 elapsedMs = executionTimer_.isValid() ? executionTimer_.elapsed() : executionStartMs_;
+    Q_UNUSED(cancelled);
     emit executionFinished(
         currentSql_, executionOperation_, elapsedMs, executionRows_, success, errorCode, error, isPlan,
-        executionId_, sessionEpoch_);
+        executionId_, sessionEpoch_, failureDetail);
 }
 
 void DpiSession::reportBrokenConnection(SessionError error) {
@@ -4125,7 +4124,8 @@ void DpiSession::reportBrokenConnection(SessionError error) {
     if (error.connectionLost) emit physicalConnectionLost(error);
     emit stateChanged(SessionState::Failed, QStringLiteral("失败：%1").arg(error.message));
     if (executionInProgress_) {
-        emitExecutionFinished(false, error.code, error.message, planMode_);
+        emitExecutionFinished(false, error.code, error.message, planMode_, false,
+            indicatesExecutionTimeout(error) ? error.technical : QString());
     }
     emit failed(error);
     emit transactionStateChanged(false);
@@ -4147,33 +4147,40 @@ void DpiSession::reportFailure(SessionError error, bool inspectActiveConnection)
         .arg(sessionEpoch_).arg(operationSequence_)
         .arg(executionOperation_.isEmpty() ? QStringLiteral("-") : executionOperation_)
         .arg(connected_ ? 1 : 0);
+    bool connectionDead = false;
     if (connection_ != nullptr) {
         sdint4 dead = DSQL_CD_FALSE;
         sdint4 length = 0;
         const DPIRETURN healthResult = dpi_get_con_attr(connection_,
             DSQL_ATTR_CONNECTION_DEAD, &dead, static_cast<sdint4>(sizeof(dead)), &length);
+        connectionDead = DSQL_SUCCEEDED(healthResult) && dead == DSQL_CD_TRUE;
         error.technical += QStringLiteral("; connectionDeadReturn=%1; connectionDead=%2")
             .arg(static_cast<int>(healthResult))
             .arg(DSQL_SUCCEEDED(healthResult) ? (dead == DSQL_CD_TRUE ? 1 : 0) : -1);
     }
-    if (inspectActiveConnection && indicatesExecutionTimeout(error)) {
-        error.category = QStringLiteral("OutcomeUnknown");
-        error.recovery = QStringLiteral(
-            "请求超时后无法确认当前语句是否已在数据库完成；发布已停止。"
-            "请重新连接并核对对象状态，不要自动重试 DDL。");
+    const bool broken = connectionDead || indicatesBrokenConnection(error);
+    const bool requestTimeout = inspectActiveConnection && indicatesExecutionTimeout(error);
+    if (requestTimeout) {
+        error.technical += QStringLiteral("; failureOrigin=dpi-request-timeout; sessionAction=%1")
+            .arg(broken ? QStringLiteral("disconnect") : QStringLiteral("retain"));
+        emit diagnosticTrace(QStringLiteral("DPI 请求超时：executionId=%1；errorCode=%2；%3")
+            .arg(executionId_).arg(error.code).arg(error.technical));
+    }
+    if (inspectActiveConnection && broken) {
+        if (requestTimeout) error.category = QStringLiteral("OutcomeUnknown");
         reportBrokenConnection(std::move(error));
         return;
     }
-    if (inspectActiveConnection && connectionIsBroken(error)) {
-        reportBrokenConnection(std::move(error));
-        return;
+    if (requestTimeout) {
+        error.recovery = QStringLiteral("当前请求执行超时。请在原会话核对事务及业务结果。");
     }
     if (executionInProgress_ && connected_) {
         updateTransactionStateAfterExecution(false);
     }
     emit stateChanged(SessionState::Failed, QStringLiteral("失败：%1").arg(error.message));
     if (executionInProgress_) {
-        emitExecutionFinished(false, error.code, error.message, planMode_);
+        emitExecutionFinished(false, error.code, error.message, planMode_, false,
+            requestTimeout ? error.technical : QString());
     }
     emit failed(std::move(error));
     if (connected_) {

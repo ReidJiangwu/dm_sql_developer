@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use serde::Serialize;
 
 use crate::{
-    backward::{CompletionContext, CompletionProbe, analyze},
+    backward::{CompletionContext, CompletionProbe, analyze_rope},
     document::Document,
     metadata::{MetadataObject, MetadataSnapshot},
 };
@@ -120,8 +120,7 @@ pub fn complete(
     cursor: usize,
     metadata: Option<&MetadataSnapshot>,
 ) -> CompletionResult {
-    let source = document.source();
-    let probe = analyze(&source, cursor);
+    let probe = analyze_rope(&document.text, cursor);
     if probe.suppressed {
         return CompletionResult {
             context: CompletionContext::Keyword.as_str().to_owned(),
@@ -135,11 +134,12 @@ pub fn complete(
         };
     }
 
+    let prefix = CompletionPrefix::new(&probe.prefix);
     let effective_context = if probe.context == CompletionContext::Keyword
         && document
-            .semantic
+            .semantic()
             .visible_locals(cursor)
-            .any(|local| matches_prefix(&local.name, &probe.prefix))
+            .any(|local| prefix.matches(&local.name))
     {
         CompletionContext::LocalVariable
     } else {
@@ -150,15 +150,16 @@ pub fn complete(
     let missing_routines = missing_routines(metadata, &probe, effective_context);
     let mut candidates = match effective_context {
         CompletionContext::Member => {
-            let (context, items) = member_candidates(document, cursor, metadata, &probe);
+            let (context, items) = member_candidates(document, cursor, metadata, &probe, &prefix);
             context_name = context;
             items
         }
-        CompletionContext::Relation => relation_candidates(document, cursor, metadata),
-        CompletionContext::Column => column_candidates(document, cursor, metadata),
+        CompletionContext::Relation => relation_candidates(document, cursor, metadata, &prefix),
+        CompletionContext::Column => column_candidates(document, cursor, metadata, &prefix),
         CompletionContext::LocalVariable | CompletionContext::BindVariable => document
-            .semantic
+            .semantic()
             .visible_locals(cursor)
+            .filter(|local| prefix.matches(&local.name))
             .map(|local| Candidate {
                 label: local.name.clone(),
                 kind: 6,
@@ -168,13 +169,13 @@ pub fn complete(
                 semantic_rank: 0,
             })
             .collect(),
-        CompletionContext::Routine => routine_candidates(metadata),
-        CompletionContext::Schema => schema_candidates(metadata),
-        CompletionContext::TypeName => type_candidates(metadata),
-        CompletionContext::Keyword => keyword_candidates(),
+        CompletionContext::Routine => routine_candidates(metadata, &prefix),
+        CompletionContext::Schema => schema_candidates(metadata, &prefix),
+        CompletionContext::TypeName => type_candidates(metadata, &prefix),
+        CompletionContext::Keyword => keyword_candidates(&prefix),
     };
 
-    filter_and_sort(&mut candidates, &probe.prefix, metadata);
+    sort_and_deduplicate(&mut candidates, prefix.raw, metadata);
     CompletionResult {
         context: context_name.clone(),
         qualifier: probe.qualifier,
@@ -221,28 +222,27 @@ fn missing_metadata(
     let mut objects = Vec::new();
     if context == CompletionContext::Member {
         if let Some(qualifier) = probe.qualifier.as_deref()
-            && let Some(relation) = document.semantic.resolve_alias(qualifier, cursor)
+            && let Some(relation) = document.semantic().resolve_alias(qualifier, cursor)
             && relation.projected.is_none()
             && document
-                .semantic
+                .semantic()
                 .resolve_cte(&relation.name, cursor)
                 .is_none()
+            && let Some(object) = missing_relation_columns(snapshot, relation.schema.as_deref(), &relation.name)
         {
-            let object = requested_relation(snapshot, relation.schema.as_deref(), &relation.name);
-            if object.columns.is_empty() { objects.push(object); }
+            objects.push(object);
         }
     } else if context == CompletionContext::Column {
-        for relation in document.semantic.visible_relations(cursor) {
+        for relation in document.semantic().visible_relations(cursor) {
             if relation.projected.is_some() { continue; }
             if document
-                .semantic
+                .semantic()
                 .resolve_cte(&relation.name, cursor)
                 .is_some()
             {
                 continue;
             }
-            let object = requested_relation(snapshot, relation.schema.as_deref(), &relation.name);
-            if object.columns.is_empty()
+            if let Some(object) = missing_relation_columns(snapshot, relation.schema.as_deref(), &relation.name)
                 && !objects
                     .iter()
                     .any(|existing: &MetadataObject| existing.key == object.key)
@@ -288,20 +288,23 @@ fn member_candidates(
     cursor: usize,
     metadata: Option<&MetadataSnapshot>,
     probe: &CompletionProbe,
+    prefix: &CompletionPrefix,
 ) -> (String, Vec<Candidate>) {
     let Some(qualifier) = probe.qualifier.as_deref() else {
         return ("Column".to_owned(), Vec::new());
     };
-    if let Some(relation) = document.semantic.resolve_alias(qualifier, cursor) {
+    if let Some(relation) = document.semantic().resolve_alias(qualifier, cursor) {
         if let Some(columns) = &relation.projected {
             return ("AliasMember".to_owned(), columns.iter()
+                .filter(|column| prefix.matches(column))
                 .map(|column| column_candidate(column, "子查询", "document", &relation.alias, 0)).collect());
         }
-        if let Some(cte) = document.semantic.resolve_cte(&relation.name, cursor) {
+        if let Some(cte) = document.semantic().resolve_cte(&relation.name, cursor) {
             return (
                 "AliasMember".to_owned(),
                 cte.columns
                     .iter()
+                    .filter(|column| prefix.matches(column))
                     .map(|column| column_candidate(column, "CTE", "document", column, 0))
                     .collect(),
             );
@@ -314,6 +317,7 @@ fn member_candidates(
                 object
                     .columns
                     .iter()
+                    .filter(|column| prefix.matches(&column.name))
                     .map(|column| {
                         column_candidate(
                             &column.name,
@@ -329,6 +333,7 @@ fn member_candidates(
     }
 
     if let Some(snapshot) = metadata {
+        let mut has_routines = false;
         let mut package_members = Vec::new();
         for object in snapshot.objects.values().filter(|object| {
             object.name.eq_ignore_ascii_case(qualifier)
@@ -337,7 +342,8 @@ fn member_candidates(
                     "PACKAGE" | "PACKAGE BODY"
                 )
         }) {
-            package_members.extend(object.routines.iter().map(|routine| Candidate {
+            has_routines |= !object.routines.is_empty();
+            package_members.extend(object.routines.iter().filter(|routine| prefix.matches(&routine.name)).map(|routine| Candidate {
                 label: routine.name.clone(),
                 kind: 3,
                 detail: routine_signature(routine),
@@ -346,7 +352,7 @@ fn member_candidates(
                 semantic_rank: 0,
             }));
         }
-        if !package_members.is_empty() {
+        if has_routines {
             return ("PackageMember".to_owned(), package_members);
         }
 
@@ -356,6 +362,7 @@ fn member_candidates(
             .filter(|object| {
                 object.schema.eq_ignore_ascii_case(qualifier) && is_relation_object(object)
             })
+            .filter(|object| prefix.matches(&object.name))
             .map(relation_candidate)
             .collect();
         if !schema_relations.is_empty()
@@ -375,12 +382,13 @@ fn relation_candidates(
     document: &Document,
     cursor: usize,
     metadata: Option<&MetadataSnapshot>,
+    prefix: &CompletionPrefix,
 ) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = document
-        .semantic
+        .semantic()
         .ctes
         .iter()
-        .filter(|cte| cte.declaration <= cursor)
+        .filter(|cte| cte.declaration <= cursor && prefix.matches(&cte.name))
         .map(|cte| Candidate {
             label: cte.name.clone(),
             kind: 22,
@@ -396,6 +404,7 @@ fn relation_candidates(
                 .objects
                 .values()
                 .filter(|object| is_relation_object(object))
+                .filter(|object| prefix.matches(&object.name))
                 .map(relation_candidate),
         );
     }
@@ -406,23 +415,25 @@ fn column_candidates(
     document: &Document,
     cursor: usize,
     metadata: Option<&MetadataSnapshot>,
+    prefix: &CompletionPrefix,
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
-    for relation in document.semantic.visible_relations(cursor) {
+    for relation in document.semantic().visible_relations(cursor) {
         if let Some(columns) = &relation.projected {
-            candidates.extend(columns.iter().map(|column| column_candidate(column, "子查询", "document", &relation.alias, 1)));
+            candidates.extend(columns.iter().filter(|column| prefix.matches(column)).map(|column| column_candidate(column, "子查询", "document", &relation.alias, 1)));
             continue;
         }
-        if let Some(cte) = document.semantic.resolve_cte(&relation.name, cursor) {
+        if let Some(cte) = document.semantic().resolve_cte(&relation.name, cursor) {
             candidates.extend(
                 cte.columns
                     .iter()
+                    .filter(|column| prefix.matches(column))
                     .map(|column| column_candidate(column, "CTE", "document", column, 1)),
             );
         } else if let Some(object) = metadata.and_then(|snapshot| {
             find_relation(snapshot, relation.schema.as_deref(), &relation.name)
         }) {
-            candidates.extend(object.columns.iter().map(|column| {
+            candidates.extend(object.columns.iter().filter(|column| prefix.matches(&column.name)).map(|column| {
                 column_candidate(
                     &column.name,
                     &column.data_type,
@@ -435,8 +446,9 @@ fn column_candidates(
     }
     candidates.extend(
         document
-            .semantic
+            .semantic()
             .visible_locals(cursor)
+            .filter(|local| prefix.matches(&local.name))
             .map(|local| Candidate {
                 label: local.name.clone(),
                 kind: 6,
@@ -449,9 +461,10 @@ fn column_candidates(
     candidates
 }
 
-fn keyword_candidates() -> Vec<Candidate> {
+fn keyword_candidates(prefix: &CompletionPrefix) -> Vec<Candidate> {
     KEYWORDS
         .iter()
+        .filter(|keyword| prefix.matches(keyword))
         .map(|keyword| Candidate {
             label: (*keyword).to_owned(),
             kind: 14,
@@ -463,7 +476,7 @@ fn keyword_candidates() -> Vec<Candidate> {
         .collect()
 }
 
-fn routine_candidates(metadata: Option<&MetadataSnapshot>) -> Vec<Candidate> {
+fn routine_candidates(metadata: Option<&MetadataSnapshot>, prefix: &CompletionPrefix) -> Vec<Candidate> {
     metadata
         .into_iter()
         .flat_map(|snapshot| snapshot.objects.values())
@@ -473,6 +486,7 @@ fn routine_candidates(metadata: Option<&MetadataSnapshot>) -> Vec<Candidate> {
                 "PROCEDURE" | "FUNCTION"
             )
         })
+        .filter(|object| prefix.matches(&object.name))
         .map(|object| Candidate {
             label: object.name.clone(),
             kind: 3,
@@ -484,14 +498,14 @@ fn routine_candidates(metadata: Option<&MetadataSnapshot>) -> Vec<Candidate> {
         .collect()
 }
 
-fn schema_candidates(metadata: Option<&MetadataSnapshot>) -> Vec<Candidate> {
+fn schema_candidates(metadata: Option<&MetadataSnapshot>, prefix: &CompletionPrefix) -> Vec<Candidate> {
     let mut seen = HashSet::new();
     metadata
         .into_iter()
         .flat_map(|snapshot| snapshot.objects.values())
         .filter_map(|object| {
             let normalized = object.schema.to_ascii_uppercase();
-            seen.insert(normalized).then(|| Candidate {
+            (seen.insert(normalized) && prefix.matches(&object.schema)).then(|| Candidate {
                 label: object.schema.clone(),
                 kind: 9,
                 detail: "Schema".to_owned(),
@@ -503,7 +517,7 @@ fn schema_candidates(metadata: Option<&MetadataSnapshot>) -> Vec<Candidate> {
         .collect()
 }
 
-fn type_candidates(metadata: Option<&MetadataSnapshot>) -> Vec<Candidate> {
+fn type_candidates(metadata: Option<&MetadataSnapshot>, prefix: &CompletionPrefix) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = [
         "BIGINT",
         "BINARY",
@@ -527,6 +541,7 @@ fn type_candidates(metadata: Option<&MetadataSnapshot>) -> Vec<Candidate> {
         "VARCHAR2",
     ]
     .into_iter()
+    .filter(|name| prefix.matches(name))
     .map(|name| Candidate {
         label: name.to_owned(),
         kind: 25,
@@ -542,6 +557,7 @@ fn type_candidates(metadata: Option<&MetadataSnapshot>) -> Vec<Candidate> {
                 .objects
                 .values()
                 .filter(|object| object.object_type.eq_ignore_ascii_case("TYPE"))
+                .filter(|object| prefix.matches(&object.name))
                 .map(|object| Candidate {
                     label: object.name.clone(),
                     kind: 25,
@@ -555,10 +571,18 @@ fn type_candidates(metadata: Option<&MetadataSnapshot>) -> Vec<Candidate> {
     candidates
 }
 
-fn requested_relation(snapshot: &MetadataSnapshot, schema: Option<&str>, name: &str) -> MetadataObject {
-    find_relation(snapshot, schema, name).cloned().unwrap_or_else(|| MetadataObject {
-        key: format!("{}:{name}", schema.unwrap_or(&snapshot.current_schema)),
-        schema: schema.unwrap_or(&snapshot.current_schema).to_owned(),
+fn missing_relation_columns(
+    snapshot: &MetadataSnapshot,
+    schema: Option<&str>,
+    name: &str,
+) -> Option<MetadataObject> {
+    if let Some(object) = find_relation(snapshot, schema, name) {
+        return object.columns.is_empty().then(|| object.clone());
+    }
+    let owner = schema.unwrap_or(&snapshot.current_schema);
+    Some(MetadataObject {
+        key: format!("{owner}:{name}"),
+        schema: owner.to_owned(),
         name: name.to_owned(),
         object_type: "TABLE".to_owned(),
         ..MetadataObject::default()
@@ -649,31 +673,19 @@ fn routine_signature(routine: &crate::metadata::MetadataRoutine) -> String {
     }
 }
 
-fn filter_and_sort(
+fn sort_and_deduplicate(
     candidates: &mut Vec<Candidate>,
     prefix: &str,
     metadata: Option<&MetadataSnapshot>,
 ) {
-    candidates.retain(|candidate| matches_prefix(&candidate.label, prefix));
     let current_schema = metadata.map(|snapshot| snapshot.current_schema.as_str());
-    candidates.sort_by(|left, right| {
-        let left_schema_rank = schema_rank(left, current_schema);
-        let right_schema_rank = schema_rank(right, current_schema);
-        (
-            left.semantic_rank,
-            left_schema_rank,
-            prefix_rank(&left.label, prefix),
-            left.label.to_ascii_uppercase(),
-            left.qualified_name.to_ascii_uppercase(),
-        )
-            .cmp(&(
-                right.semantic_rank,
-                right_schema_rank,
-                prefix_rank(&right.label, prefix),
-                right.label.to_ascii_uppercase(),
-                right.qualified_name.to_ascii_uppercase(),
-            ))
-    });
+    candidates.sort_by_cached_key(|candidate| (
+        candidate.semantic_rank,
+        schema_rank(candidate, current_schema),
+        prefix_rank(&candidate.label, prefix),
+        candidate.label.to_ascii_uppercase(),
+        candidate.qualified_name.to_ascii_uppercase(),
+    ));
     let mut seen = HashSet::new();
     candidates.retain(|candidate| {
         seen.insert((
@@ -684,20 +696,29 @@ fn filter_and_sort(
     });
 }
 
-fn matches_prefix(label: &str, prefix: &str) -> bool {
-    prefix.is_empty()
-        || label
-            .to_ascii_uppercase()
-            .starts_with(&prefix.to_ascii_uppercase())
-        || compact_identifier(label).starts_with(&compact_identifier(prefix))
+struct CompletionPrefix<'a> {
+    raw: &'a str,
+    compact: String,
+}
+
+impl<'a> CompletionPrefix<'a> {
+    fn new(raw: &'a str) -> Self {
+        Self { raw, compact: compact_identifier(raw) }
+    }
+
+    fn matches(&self, label: &str) -> bool {
+        if label.get(..self.raw.len()).is_some_and(|head| head.eq_ignore_ascii_case(self.raw)) {
+            return true;
+        }
+        let mut chars = label.chars().filter(|c| *c != '_').flat_map(char::to_uppercase);
+        self.compact.chars().all(|expected| chars.next() == Some(expected))
+    }
 }
 
 fn prefix_rank(label: &str, prefix: &str) -> u8 {
     if prefix.is_empty() || label.starts_with(prefix) {
         0
-    } else if label
-        .to_ascii_uppercase()
-        .starts_with(&prefix.to_ascii_uppercase())
+    } else if label.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
     {
         1
     } else {
@@ -763,6 +784,16 @@ mod tests {
     }
 
     #[test]
+    fn prefix_filter_retains_underscore_and_unicode_case_matching() {
+        for (prefix, label, expected) in [
+            ("ordid", "ORD_ID", true), ("ß", "SS_VALUE", true),
+            ("_", "NAME", true), ("", "NAME", true), ("it", "ORDER_ID", false),
+        ] {
+            assert_eq!(CompletionPrefix::new(prefix).matches(label), expected);
+        }
+    }
+
+    #[test]
     fn completes_alias_columns() {
         let sql = "SELECT o.AM FROM ORDERS o";
         let document = Document::open(1, sql.into(), None).unwrap();
@@ -802,7 +833,7 @@ mod tests {
         }
         let sql = "SELECT x. FROM ORDERS x JOIN OTHER_ORDERS x ON 1=1";
         let doc = Document::open(1, sql.into(), None).unwrap();
-        assert!(doc.semantic.resolve_alias("x", "SELECT x.".len()).is_none());
+        assert!(doc.semantic().resolve_alias("x", "SELECT x.".len()).is_none());
         let sql = "SELECT d. FROM (SELECT amount*2 FROM ORDERS) d";
         let doc = Document::open(1, sql.into(), None).unwrap();
         let result = complete(&doc, "SELECT d.".len(), Some(&metadata()));

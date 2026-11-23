@@ -43,7 +43,7 @@ public:
         int gracefulTimeoutMs = 1'000, int terminateTimeoutMs = 1'000);
 
     void registerEditor(SqlEditor* editor);
-    void bindSqlEditor(SqlEditor* editor, const QString& profileId);
+    void bindSqlEditor(SqlEditor* editor, const QString& profileId, bool invalidateExisting = false);
     void invalidateSqlMetadata(SqlEditor* editor);
     void applySqlColumns(SqlEditor* editor, quint64 generation, const QString& schema,
         const QString& currentSchema, const QString& table,
@@ -88,6 +88,10 @@ private:
     struct DocumentState {
         QString uri;
         QString text;
+        QVector<int> newlines;
+        void resetText(QString value);
+        void replaceText(int start, int end, const QString& inserted);
+        [[nodiscard]] QJsonObject positionAt(int offset) const;
         QString connectionId;
         qint64 version = 1;
         bool opened = false;
@@ -133,17 +137,20 @@ private:
     void beginInitialize();
     void openDocument(SqlEditor* editor);
     void sendSqlMetadata(const DocumentState& state);
+    void sendSqlCatalogChanges(const QString& profileId, const QJsonArray& changed);
+    void sendSqlUpsert(const DocumentState& state, const QJsonArray& objects);
     void closeDocument(SqlEditor* editor);
     void documentChanged(SqlEditor* editor, int position, int charsRemoved, int charsAdded);
     void consumeOutput();
     void handleMessage(const QJsonObject& message);
     void sendNotification(const QString& method, QJsonObject params);
+    void sendMetadataBatches(const QString& method, QJsonObject params,
+        const QString& field, const QJsonArray& values);
     [[nodiscard]] qint64 sendRequest(const QString& method, QJsonObject params);
     void sendMessage(QJsonObject message);
     void stopProcess();
     [[nodiscard]] QString resolveServerPath() const;
 
-    [[nodiscard]] static QJsonObject positionAt(const QString& text, int offset);
     [[nodiscard]] static QString metadataKey(const ObjectKey& key);
     [[nodiscard]] static QString objectTypeName(DatabaseObjectType type);
     [[nodiscard]] static bool objectTypeFromName(
@@ -152,6 +159,7 @@ private:
 
     QProcess* process_ = nullptr;
     QByteArray readBuffer_;
+    QByteArray stderrTail_;
     QHash<SqlEditor*, DocumentState> documents_;
     QHash<qint64, PendingCompletion> pendingCompletions_;
     QHash<qint64, PendingCompletion> pendingSignatures_;

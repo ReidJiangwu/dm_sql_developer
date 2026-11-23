@@ -7,6 +7,8 @@
 #include "../data/OperationLogStore.h"
 
 #include <QByteArray>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QElapsedTimer>
 #include <QHash>
 #include <QList>
@@ -139,7 +141,7 @@ private:
     void updateExecutionFeedback(qint64 elapsedMs = -1);
     void handleExecutionFinished(const QString& sql, const QString& operation, qint64 elapsedMs,
         qint64 rows, bool success, int errorCode, const QString& error, bool isPlan,
-        quint64 executionId = 0, quint64 sessionEpoch = 0);
+        quint64 executionId = 0, quint64 sessionEpoch = 0, const QString& failureDetail = {});
     void rebuildPlanTree();
     void setStatistic(const QString& name, const QString& value);
     QueryResultModel* modelForResult(int resultIndex, const QStringList& columns);
@@ -266,7 +268,13 @@ private:
     quint64 nextExecutionId_ = 0;
     quint64 activeExecutionId_ = 0;
     QList<int> splitSizes_ = {700, 300};
-    QByteArray restoredGridWorkspaceState_;
+    mutable QPointer<QTableView> cachedGridTable_;
+    mutable int cachedGridViewportWidth_ = -1;
+    mutable QByteArray cachedGridHeader_;
+    mutable QJsonArray cachedGridColumns_;
+    mutable QJsonObject cachedGridState_;
+    mutable QByteArray cachedGridBytes_;
+    QJsonObject restoredGridWorkspaceState_;
     QThread* sessionThread_ = nullptr;
     DpiSession* session_ = nullptr;
     ConnectionProfile profile_;

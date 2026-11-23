@@ -1,3 +1,7 @@
+use std::borrow::Cow;
+
+use ropey::Rope;
+
 const MAX_BACKWARD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,14 +66,21 @@ enum LexState {
     BlockComment,
 }
 
+pub(crate) fn analyze_rope(text: &Rope, cursor_byte: usize) -> CompletionProbe {
+    let end_char = text.byte_to_char(cursor_byte.min(text.len_bytes()));
+    let end_byte = text.char_to_byte(end_char);
+    let start_char = text.byte_to_char(end_byte.saturating_sub(MAX_BACKWARD_BYTES));
+    // Include the preceding character so a bind colon before the window is visible.
+    let base_char = start_char.saturating_sub(1);
+    let window: Cow<'_, str> = text.slice(base_char..end_char).into();
+    let mut probe = analyze(&window, window.len());
+    probe.replace_start += text.char_to_byte(base_char);
+    probe
+}
+
 pub fn analyze(text: &str, cursor_byte: usize) -> CompletionProbe {
     let cursor = clamp_char_boundary(text, cursor_byte.min(text.len()));
-    let mut start = cursor.saturating_sub(MAX_BACKWARD_BYTES);
-    start = clamp_char_boundary(text, start);
-    if let Some(statement_start) = last_statement_start(&text[start..cursor]) {
-        start += statement_start;
-    }
-
+    let start = clamp_char_boundary(text, cursor.saturating_sub(MAX_BACKWARD_BYTES));
     let lexed = lex_sql(&text[start..cursor], start);
     if lexed.state != LexState::Code {
         return CompletionProbe {
@@ -81,7 +92,10 @@ pub fn analyze(text: &str, cursor_byte: usize) -> CompletionProbe {
         };
     }
 
-    let tokens = lexed.tokens;
+    let statement_start = lexed.tokens.iter()
+        .rposition(|token| token.kind == TokenKind::Symbol && token.text == ";")
+        .map_or(0, |index| index + 1);
+    let tokens = &lexed.tokens[statement_start..];
     let mut prefix = String::new();
     let mut replace_start = cursor;
     let mut before_prefix = tokens.len();
@@ -131,6 +145,7 @@ pub fn analyze(text: &str, cursor_byte: usize) -> CompletionProbe {
         .iter()
         .rev()
         .filter(|token| token.kind == TokenKind::Word)
+        .take(8)
         .map(|token| token.text.as_str())
         .collect();
     let nearest = words.first().map(|word| word.to_ascii_uppercase());
@@ -140,8 +155,8 @@ pub fn analyze(text: &str, cursor_byte: usize) -> CompletionProbe {
         Some("AS" | "IS") if contains_program_header(&words) => CompletionContext::TypeName,
         Some("DECLARE") => CompletionContext::LocalVariable,
         Some("SELECT" | "WHERE" | "ON" | "SET" | "HAVING" | "BY") => CompletionContext::Column,
-        _ if inside_declare_section(&tokens) => CompletionContext::LocalVariable,
-        _ if inside_program_block(&tokens) => CompletionContext::LocalVariable,
+        _ if inside_declare_section(tokens) => CompletionContext::LocalVariable,
+        _ if inside_program_block(tokens) => CompletionContext::LocalVariable,
         _ => CompletionContext::Keyword,
     };
 
@@ -157,7 +172,6 @@ pub fn analyze(text: &str, cursor_byte: usize) -> CompletionProbe {
 fn contains_program_header(words: &[&str]) -> bool {
     words
         .iter()
-        .take(8)
         .any(|word| matches!(word.to_ascii_uppercase().as_str(), "PROCEDURE" | "FUNCTION"))
 }
 
@@ -199,16 +213,6 @@ fn is_word_token(token: &LexToken, expected: &str) -> bool {
     token.kind == TokenKind::Word && token.text.eq_ignore_ascii_case(expected)
 }
 
-fn last_statement_start(text: &str) -> Option<usize> {
-    let lexed = lex_sql(text, 0);
-    lexed
-        .tokens
-        .iter()
-        .rev()
-        .find(|token| token.kind == TokenKind::Symbol && token.text == ";")
-        .map(|token| token.end)
-}
-
 struct Lexed {
     tokens: Vec<LexToken>,
     state: LexState,
@@ -226,8 +230,11 @@ fn lex_sql(text: &str, base: usize) -> Lexed {
     while index < bytes.len() {
         match state {
             LexState::Code => {
-                if bytes[index].is_ascii_whitespace() {
-                    index += 1;
+                // Code-state positions are UTF-8 boundaries. Advance by a whole
+                // scalar, including for unknown punctuation, before slicing tokens.
+                let character = text[index..].chars().next().unwrap_or('\0');
+                if character.is_whitespace() {
+                    index += character.len_utf8();
                 } else if bytes[index] == b'-' && bytes.get(index + 1) == Some(&b'-') {
                     state = LexState::LineComment;
                     index += 2;
@@ -265,11 +272,14 @@ fn lex_sql(text: &str, base: usize) -> Lexed {
                         start: base + start,
                         end: base + index,
                     });
-                } else if is_identifier_start(bytes[index]) {
+                } else if is_identifier_start(character) {
                     let start = index;
-                    index += 1;
-                    while index < bytes.len() && is_identifier_continue(bytes[index]) {
-                        index += 1;
+                    index += character.len_utf8();
+                    while let Some(next) = text[index..].chars().next() {
+                        if !is_identifier_continue(next) {
+                            break;
+                        }
+                        index += next.len_utf8();
                     }
                     tokens.push(LexToken {
                         kind: TokenKind::Word,
@@ -294,7 +304,7 @@ fn lex_sql(text: &str, base: usize) -> Lexed {
                     });
                 } else {
                     let start = index;
-                    index += 1;
+                    index += character.len_utf8();
                     if matches!(
                         (bytes[start], bytes.get(index).copied()),
                         (b':', Some(b'='))
@@ -349,12 +359,12 @@ fn lex_sql(text: &str, base: usize) -> Lexed {
     Lexed { tokens, state }
 }
 
-fn is_identifier_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
+fn is_identifier_start(character: char) -> bool {
+    character.is_alphabetic() || character == '_'
 }
 
-fn is_identifier_continue(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'#')
+fn is_identifier_continue(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '$' | '#')
 }
 
 fn clamp_char_boundary(text: &str, mut offset: usize) -> usize {
@@ -389,5 +399,58 @@ mod tests {
         let probe = analyze(sql, sql.len());
         assert_eq!(probe.context, CompletionContext::Relation);
         assert_eq!(probe.prefix, "OR");
+    }
+
+    #[test]
+    fn rope_probe_preserves_statement_boundaries_and_absolute_offsets() {
+        let sql = "SELECT 'a;b'; SELECT /* ; */ 表名.列";
+        let rope = Rope::from_str(sql);
+        for cursor in 0..=sql.len() {
+            assert_eq!(analyze_rope(&rope, cursor), analyze(sql, cursor));
+        }
+        let probe = analyze_rope(&rope, sql.len());
+        assert_eq!(probe.qualifier.as_deref(), Some("表名"));
+        assert_eq!(&sql[probe.replace_start..], "列");
+
+        let sql = format!("SELECT :{}", "a".repeat(MAX_BACKWARD_BYTES));
+        let probe = analyze_rope(&Rope::from_str(&sql), sql.len());
+        assert_eq!(probe.context, CompletionContext::BindVariable);
+        assert_eq!(probe.replace_start, "SELECT :".len());
+    }
+
+    #[test]
+    fn unicode_code_tokens_keep_utf8_boundaries() {
+        let sql = "\u{feff}SELECT\u{a0}客户_1.名称，🙂 FROM 表名;";
+        let values = tokens(sql);
+        assert!(values.iter().any(|t| t.kind == TokenKind::Word && t.text == "客户_1"));
+        assert!(values.iter().any(|t| t.kind == TokenKind::Word && t.text == "表名"));
+        assert!(values.iter().any(|t| t.kind == TokenKind::Symbol && t.text == "🙂"));
+        assert!(values.iter().any(|t| t.kind == TokenKind::Symbol && t.text == "，"));
+        assert!(!values.iter().any(|t| t.text == "\u{a0}"));
+        for token in values {
+            assert!(sql.is_char_boundary(token.start) && sql.is_char_boundary(token.end));
+            assert_eq!(&sql[token.start..token.end], token.text);
+        }
+        let prefix = "SELECT 客户_1.名";
+        let probe = analyze(prefix, prefix.len());
+        assert_eq!(probe.qualifier.as_deref(), Some("客户_1"));
+        assert_eq!(probe.prefix, "名");
+        assert_eq!(&prefix[probe.replace_start..], "名");
+    }
+
+    #[test]
+    fn unicode_strings_comments_and_backwards_window_remain_safe() {
+        let sql = "SELECT '中文🙂', \"列\"\"名\" /* 中文 */ FROM 表名 -- 注释\nWHERE 名称 = '值';";
+        for cursor in 0..=sql.len() {
+            let probe = analyze(sql, cursor);
+            assert!(sql.is_char_boundary(probe.replace_start));
+        }
+        let long = format!("{} SELECT 表名.列", "中".repeat(MAX_BACKWARD_BYTES));
+        let probe = analyze(&long, long.len());
+        assert_eq!(analyze_rope(&Rope::from_str(&long), long.len()), probe);
+        assert_eq!(probe.qualifier.as_deref(), Some("表名"));
+        assert_eq!(probe.prefix, "列");
+        assert!(analyze("SELECT '未结束🙂", "SELECT '未结束🙂".len()).suppressed);
+        assert!(analyze("SELECT /* 未结束🙂", "SELECT /* 未结束🙂".len()).suppressed);
     }
 }

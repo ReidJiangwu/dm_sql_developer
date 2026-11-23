@@ -54,15 +54,12 @@ fn merge_fallback_package_routines(
     }) else {
         return;
     };
+    let mut ids: std::collections::HashSet<_> =
+        package.children.iter().map(|symbol| symbol.symbol_id.clone()).collect();
     for routine in routines {
-        if package
-            .children
-            .iter()
-            .any(|symbol| symbol.symbol_id == routine.symbol_id)
-        {
-            continue;
+        if ids.insert(routine.symbol_id.clone()) {
+            package.children.push(routine);
         }
-        package.children.push(routine);
     }
     package.children.sort_by_key(|symbol| symbol.source_order);
 }

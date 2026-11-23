@@ -256,6 +256,14 @@ fn handle_document_symbol_request(
         )))?;
         return Ok(());
     };
+    if document.text.len_bytes() > document::MAX_DOCUMENT_BYTES {
+        connection.sender.send(Message::Response(Response::new_err(
+            request.id,
+            -32602,
+            "源码超过 8 MiB，成员解析不可用".to_owned(),
+        )))?;
+        return Ok(());
+    }
     connection.sender.send(Message::Response(Response::new_ok(
         request.id,
         serde_json::to_value(symbols::document_symbols(document))?,
@@ -457,8 +465,9 @@ fn handle_notification(
         "textDocument/didChange" => {
             let params: DidChangeParams = serde_json::from_value(notification.params)?;
             let uri = params.text_document.uri.clone();
-            documents.change(params)?;
-            publish_diagnostics(connection, documents, &uri)?;
+            if documents.change(params)? {
+                publish_diagnostics(connection, documents, &uri)?;
+            }
         }
         "textDocument/didClose" => {
             let params: DidCloseParams = serde_json::from_value(notification.params)?;
@@ -471,17 +480,20 @@ fn handle_notification(
                     json!({ "uri": uri, "diagnostics": [] }),
                 )))?;
         }
-        "reid/metadata/reset" => {
-            ensure_metadata_size(&notification.params)?;
-            metadata.reset(serde_json::from_value::<ResetParams>(notification.params)?);
-        }
-        "reid/metadata/upsert" => {
-            ensure_metadata_size(&notification.params)?;
-            metadata.upsert(serde_json::from_value::<UpsertParams>(notification.params)?);
-        }
-        "reid/metadata/remove" => {
-            ensure_metadata_size(&notification.params)?;
-            metadata.remove(serde_json::from_value::<RemoveParams>(notification.params)?);
+        "reid/metadata/reset" | "reid/metadata/upsert" | "reid/metadata/remove" => {
+            // Invalid metadata must not take down unrelated local document services.
+            let connection_id = notification.params.get("connectionId").cloned();
+            let generation = notification.params.get("generation").cloned();
+            if let Err(reason) = apply_metadata_notification(metadata, notification) {
+                connection.sender.send(Message::Notification(Notification::new(
+                    "reid/metadata/rejected".to_owned(),
+                    json!({
+                        "connectionId": connection_id,
+                        "generation": generation,
+                        "reason": reason,
+                    }),
+                )))?;
+            }
         }
         "workspace/didChangeConfiguration" => {
             if let Some(profile) = formatter_profile_from_settings(&notification.params) {
@@ -560,9 +572,107 @@ fn publish_diagnostics(
     Ok(())
 }
 
-fn ensure_metadata_size(value: &Value) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if serde_json::to_vec(value)?.len() > MAX_METADATA_MESSAGE_BYTES {
-        return Err("metadata notification exceeds 4 MiB".into());
+fn apply_metadata_notification(
+    metadata: &mut MetadataStore,
+    notification: Notification,
+) -> Result<(), &'static str> {
+    if serde_json::to_vec(&notification.params).map_err(|_| "invalid")?.len()
+        > MAX_METADATA_MESSAGE_BYTES
+    {
+        return Err("tooLarge");
+    }
+    // Deserialize completely before mutating the snapshot; rejected batches preserve it.
+    match notification.method.as_str() {
+        "reid/metadata/reset" => metadata.reset(
+            serde_json::from_value::<ResetParams>(notification.params).map_err(|_| "invalid")?,
+        ),
+        "reid/metadata/upsert" => metadata.upsert(
+            serde_json::from_value::<UpsertParams>(notification.params).map_err(|_| "invalid")?,
+        ),
+        "reid/metadata/remove" => metadata.remove(
+            serde_json::from_value::<RemoveParams>(notification.params).map_err(|_| "invalid")?,
+        ),
+        _ => return Err("invalid"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod metadata_notification_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn rejected_metadata_preserves_snapshot_and_document_symbols() {
+        let (server, client) = Connection::memory();
+        let mut documents = DocumentStore::default();
+        let mut metadata = MetadataStore::default();
+        let mut profile = FormatterProfile::default();
+        let cancellations = Arc::new(Mutex::new(HashMap::new()));
+        documents.open(serde_json::from_value(json!({
+            "textDocument": {"uri": "file:///p.sql", "version": 1,
+                "text": "CREATE OR REPLACE PACKAGE p AS field_ NUMBER; END p;"}
+        })).unwrap()).unwrap();
+        apply_metadata_notification(&mut metadata, Notification::new(
+            "reid/metadata/reset".into(), json!({
+                "connectionId": "test", "generation": 2, "currentSchema": "APP",
+                "objects": [{"key": "saved", "schema": "APP",
+                    "objectType": "TABLE", "name": "SAVED"}]
+            }),
+        )).unwrap();
+
+        for method in ["reid/metadata/reset", "reid/metadata/upsert", "reid/metadata/remove"] {
+            for oversized in [false, true] {
+                let mut params = json!({"connectionId": "test", "generation": 2,
+                    "objects": "invalid", "keys": "invalid"});
+                if oversized {
+                    params["padding"] = Value::String("x".repeat(MAX_METADATA_MESSAGE_BYTES));
+                }
+                handle_notification(&server, &mut documents, &mut metadata, &mut profile,
+                    &cancellations, Notification::new(method.into(), params)).unwrap();
+                let Message::Notification(rejected) = client.receiver
+                    .recv_timeout(Duration::from_secs(1)).unwrap() else {
+                    panic!("expected metadata rejection");
+                };
+                assert_eq!(rejected.method, "reid/metadata/rejected");
+                assert_eq!(rejected.params["reason"], if oversized { "tooLarge" } else { "invalid" });
+                assert_eq!(rejected.params["connectionId"], "test");
+                assert_eq!(rejected.params["generation"], 2);
+                let snapshot = metadata.snapshot(Some("test")).unwrap();
+                assert_eq!(snapshot.objects.len(), 1);
+                assert!(snapshot.objects.contains_key("SAVED"));
+            }
+        }
+        // A subsequent normal batch and symbol request still work in the same service.
+        handle_notification(&server, &mut documents, &mut metadata, &mut profile,
+            &cancellations, Notification::new("reid/metadata/upsert".into(), json!({
+                "connectionId": "test", "generation": 2,
+                "objects": [{"key": "new", "schema": "APP",
+                    "objectType": "TABLE", "name": "NEW"}]
+            }))).unwrap();
+        assert_eq!(metadata.snapshot(Some("test")).unwrap().objects.len(), 2);
+        handle_document_symbol_request(&server, &documents, Request::new(
+            RequestId::from(7), "textDocument/documentSymbol".into(),
+            json!({"textDocument": {"uri": "file:///p.sql"}}),
+        )).unwrap();
+        let Message::Response(response) = client.receiver
+            .recv_timeout(Duration::from_secs(1)).unwrap() else {
+            panic!("expected document symbols");
+        };
+        assert!(response.error.is_none());
+        assert!(response.result.unwrap().to_string().contains("field_"));
+    }
+
+    #[test]
+    fn metadata_size_limit_accepts_exact_boundary() {
+        let mut params = json!({"connectionId": "test", "generation": 1, "padding": ""});
+        let overhead = serde_json::to_vec(&params).unwrap().len();
+        params["padding"] = Value::String("x".repeat(MAX_METADATA_MESSAGE_BYTES - overhead));
+        let mut metadata = MetadataStore::default();
+        assert!(apply_metadata_notification(&mut metadata,
+            Notification::new("reid/metadata/reset".into(), params.clone())).is_ok());
+        params["padding"] = Value::String("x".repeat(MAX_METADATA_MESSAGE_BYTES - overhead + 1));
+        assert_eq!(apply_metadata_notification(&mut metadata,
+            Notification::new("reid/metadata/reset".into(), params)), Err("tooLarge"));
+    }
 }

@@ -70,6 +70,8 @@ pub struct UpsertParams {
     pub connection_id: String,
     pub generation: u64,
     #[serde(default)]
+    pub current_schema: Option<String>,
+    #[serde(default)]
     pub objects: Vec<MetadataObject>,
 }
 
@@ -134,6 +136,9 @@ impl MetadataStore {
         if params.generation != snapshot.generation {
             return;
         }
+        if let Some(schema) = params.current_schema {
+            snapshot.current_schema = schema;
+        }
         for object in params.objects {
             snapshot.objects.insert(normalized_key(&object), object);
         }
@@ -167,6 +172,30 @@ fn normalized_key(object: &MetadataObject) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn column_delta_updates_only_its_window_and_generation() {
+        let mut store = MetadataStore::default();
+        for window in ["a", "b"] {
+            store.reset(ResetParams {
+                connection_id: window.into(), generation: 2, current_schema: "BASE".into(),
+                objects: vec![MetadataObject { key: "existing".into(), ..Default::default() }],
+                ..Default::default()
+            });
+        }
+        let delta = UpsertParams {
+            connection_id: "a".into(), generation: 2, current_schema: Some("PRIVATE".into()),
+            objects: vec![MetadataObject { key: "table".into(), ..Default::default() }],
+        };
+        store.upsert(delta.clone());
+        store.upsert(UpsertParams { generation: 1, current_schema: Some("STALE".into()), ..delta });
+        let a = store.snapshot(Some("a")).unwrap();
+        assert_eq!(a.current_schema, "PRIVATE");
+        assert!(a.objects.contains_key("TABLE") && a.objects.contains_key("EXISTING"));
+        let b = store.snapshot(Some("b")).unwrap();
+        assert_eq!(b.current_schema, "BASE");
+        assert!(!b.objects.contains_key("TABLE"));
+    }
 
     #[test]
     fn ignores_stale_generations() {

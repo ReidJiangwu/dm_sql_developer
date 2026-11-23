@@ -50,6 +50,7 @@ struct CommandUnit {
     QStringList arguments;
     CommandSourceLocation source;
     QMap<QString, QString> rememberedVariables;
+    bool isVrtCreationBlock = false;
 };
 
 struct CommandVariableReference {

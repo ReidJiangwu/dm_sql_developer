@@ -227,8 +227,8 @@ QString ConnectionProfile::validationError(
     if (timeoutSeconds < 1 || timeoutSeconds > 300) {
         return QStringLiteral("连接超时必须在 1～300 秒之间。");
     }
-    if (executionTimeoutSeconds < 1 || executionTimeoutSeconds > 86'400) {
-        return QStringLiteral("SQL 执行超时必须在 1～86400 秒之间。");
+    if (executionTimeoutSeconds < 0 || executionTimeoutSeconds > 86'400) {
+        return QStringLiteral("SQL 执行超时必须在 0～86400 秒之间，0 表示不限制。");
     }
     if (fetchTimeoutSeconds < 1 || fetchTimeoutSeconds > 86'400) {
         return QStringLiteral("结果获取超时必须在 1～86400 秒之间。");
@@ -358,7 +358,7 @@ ConnectionProfile ConnectionProfile::fromJson(const QJsonObject& object) {
         object.value(QStringLiteral("sqlTextEncoding")).toString(QStringLiteral("UTF-8")));
     profile.timeoutSeconds = object.value(QStringLiteral("timeoutSeconds")).toInt(15);
     profile.executionTimeoutSeconds =
-        object.value(QStringLiteral("executionTimeoutSeconds")).toInt(300);
+        object.value(QStringLiteral("executionTimeoutSeconds")).toInt(profile.executionTimeoutSeconds);
     profile.fetchTimeoutSeconds =
         object.value(QStringLiteral("fetchTimeoutSeconds")).toInt(60);
     profile.cancelTimeoutSeconds =

@@ -29,4 +29,3 @@ inline QByteArray inflate(const QByteArray& input, quint32 size, QString& error)
     return output;
 }
 }
-

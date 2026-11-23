@@ -1,3 +1,4 @@
+#include "../core/ProductFeatures.h"
 #include "LogView.h"
 #include "InterfaceIcons.h"
 #include "Theme.h"
@@ -420,6 +421,7 @@ CommandDocumentWidget::CommandDocumentWidget(int documentNumber, QWidget* parent
     output_ = new QPlainTextEdit(outputTabs_); LogView::configure(output_);
     output_->setObjectName(QStringLiteral("commandOutput"));
     output_->setReadOnly(true);
+    output_->setUndoRedoEnabled(false);
     output_->installEventFilter(this);
     connect(followLog_, &QCheckBox::toggled, this, [this](bool enabled) {
         if (enabled) {
@@ -434,9 +436,7 @@ CommandDocumentWidget::CommandDocumentWidget(int documentNumber, QWidget* parent
     connect(outputTabs_, &QTabWidget::currentChanged, this, [this](int index) {
         if (index == 0) QTimer::singleShot(0, this, &CommandDocumentWidget::scrollOutputToEnd);
     });
-    output_->setPlainText(QStringLiteral("Command Window 已就绪。"));
-    outputBlocks_.enqueue(QStringLiteral("Command Window 已就绪。"));
-    outputBytes_ = outputBlocks_.head().toUtf8().size();
+    appendOutputView(QStringLiteral("Command Window 已就绪。"));
     outputTabs_->addTab(output_, QStringLiteral("全部"));
     outputTabs_->setTabToolTip(0, QStringLiteral("查看全部执行日志"));
     auto* errorPage = new QWidget(outputTabs_);
@@ -521,7 +521,7 @@ CommandDocumentWidget::CommandDocumentWidget(int documentNumber, QWidget* parent
         copySelectedPaths->setEnabled(hasSelectedPath);
     });
     outputNavigation_ = new CompactTabNavigation(outputTabs_, outputHeader_);
-    outputNavigation_->activated = [this] { setOutputExpanded(true); };
+    outputNavigation_->activated = [this] { if (!outputExpanded_) setOutputExpanded(true); };
     outputHeaderLayout->insertWidget(1, outputNavigation_, 1);
     outputHeaderLayout->setStretchFactor(progressLabel_, 0);
     progressLabel_->setMaximumWidth(180);
@@ -1048,6 +1048,7 @@ bool CommandDocumentWidget::hasPendingTransaction() const {
         if (worker.document->hasPendingTransaction()) return true;
     return false;
 }
+QTextDocument* CommandDocumentWidget::scriptDocument() const { return editor_->document(); }
 QString CommandDocumentWidget::scriptText() const { return editor_->toPlainText(); }
 QString CommandDocumentWidget::filePath() const { return currentFile_; }
 bool CommandDocumentWidget::defineEnabled() const { return defineEnabled_; }
@@ -1708,7 +1709,7 @@ void CommandDocumentWidget::executePlan(CommandPlanResult result) {
                 QStringLiteral("将在生产连接“%1”执行含 DML／DDL 的命令脚本。"
                                "已成功的 DDL 可能不可回滚，确认继续？").arg(profile_.name),
                 QMessageBox::Yes | QMessageBox::No, QMessageBox::No,
-            QStringLiteral("继续执行"), QStringLiteral("取消执行")) != QMessageBox::Yes) {
+            QStringLiteral("继续"), QStringLiteral("取消")) != QMessageBox::Yes) {
         QFile::remove(result.planPath);
         return;
     }
@@ -1739,6 +1740,7 @@ void CommandDocumentWidget::executePlan(CommandPlanResult result) {
     currentPlanFinished_ = false;
     runningUnits_.clear();
     nextUnit_ = 0;
+    skippedCacheUnits_ = 0;
     succeededUnits_ = 0;
     failedUnits_ = 0;
     waitingSql_ = false;
@@ -1886,7 +1888,7 @@ bool CommandDocumentWidget::startParallelPublish(QVector<CommandUnit> files, boo
     nestedParallelFailureBaseline_ = failedUnits_;
     parallelFiles_ = std::move(files);
     parallelNextFile_ = parallelCompletedFiles_ = parallelFailedFiles_ = 0;
-    if (!nestedBatch) succeededUnits_ = failedUnits_ = 0;
+    if (!nestedBatch) skippedCacheUnits_ = succeededUnits_ = failedUnits_ = 0;
     currentSqlSource_ = {};
     currentSqlText_.clear();
     currentRunningFile_.clear();
@@ -1960,10 +1962,11 @@ void CommandDocumentWidget::advanceParallelPublish() {
             if (!succeeded) ++parallelFailedFiles_;
             if (!succeeded && worker->completedProgressMaximum_ == 0)
                 parallelProgressIncomplete_ = true;
+            skippedCacheUnits_ += worker->skippedCacheUnits_;
             succeededUnits_ += worker->succeededUnits_;
             failedUnits_ += qMax<qint64>(succeeded ? 0 : 1, worker->failedUnits_);
             if (nestedParallelBatch_) {
-                processedPlanUnits_ += worker->succeededUnits_ + worker->failedUnits_;
+                processedPlanUnits_ += worker->succeededUnits_ + worker->failedUnits_ + worker->skippedCacheUnits_;
                 if (slot.unit.argument == parallelFiles_.last().argument) {
                     lastSqlBuffer_ = worker->lastSqlBuffer_;
                     lastSqlBufferSource_ = worker->lastSqlBufferSource_;
@@ -2028,7 +2031,7 @@ void CommandDocumentWidget::advanceParallelPublish() {
         slot.unit = parallelFiles_.at(fileIndex);
         slot.assigned = true;
         worker->clearOutputAndErrors();
-        worker->succeededUnits_ = worker->failedUnits_ = 0;
+        worker->skippedCacheUnits_ = worker->succeededUnits_ = worker->failedUnits_ = 0;
         worker->completedPublishStatus_.clear();
         worker->currentFile_ = slot.unit.argument;
         worker->currentSqlSource_ = {};
@@ -2276,7 +2279,7 @@ void CommandDocumentWidget::executePreparedUnits(QVector<CommandUnit> units) {
                 QStringLiteral("将在生产连接“%1”执行含 DML／DDL 的命令脚本。"
                                "已成功的 DDL 可能不可回滚，确认继续？").arg(profile_.name),
                 QMessageBox::Yes | QMessageBox::No, QMessageBox::No,
-            QStringLiteral("继续执行"), QStringLiteral("取消执行")) != QMessageBox::Yes) {
+            QStringLiteral("继续"), QStringLiteral("取消")) != QMessageBox::Yes) {
         return;
     }
     executeUnits(std::move(plan), files);
@@ -2308,6 +2311,7 @@ void CommandDocumentWidget::executeUnits(QVector<CommandUnit> units, QStringList
     currentRunningFile_.clear();
     nextUnit_ = 0;
     currentProgressSource_ = {};
+    skippedCacheUnits_ = 0;
     succeededUnits_ = 0;
     failedUnits_ = 0;
     waitingSql_ = false;
@@ -2380,6 +2384,7 @@ void CommandDocumentWidget::captureLeafCheckpoint(const QVector<CommandUnit>& un
     checkpoint.endUnit = nextUnit_ + units.size();
     checkpoint.processed = processedPlanUnits_;
     checkpoint.succeeded = succeededUnits_;
+    checkpoint.skippedCacheUnits = skippedCacheUnits_;
     checkpoint.failed = failedUnits_;
     checkpoint.variables = variables_;
     checkpoint.executionVariables = executionPredefinedVariables_;
@@ -2410,6 +2415,7 @@ void CommandDocumentWidget::restoreLeafCheckpoint() {
     nextUnit_ = checkpoint.firstUnit;
     processedPlanUnits_ = checkpoint.processed;
     succeededUnits_ = checkpoint.succeeded;
+    skippedCacheUnits_ = checkpoint.skippedCacheUnits;
     failedUnits_ = checkpoint.failed;
     currentFileSucceeded_ = currentFileFailed_ = currentFileSkipped_ = 0;
     currentRunningFile_ = checkpoint.file;
@@ -2561,7 +2567,7 @@ void CommandDocumentWidget::processNext() {
             appendOutput(QStringLiteral(
                 "错误停止：脚本已停止。成功 %1，失败 %2，跳过 %3。")
                 .arg(succeededUnits_).arg(failedUnits_)
-                .arg(qMax<qint64>(0, currentPlanUnits_ - processedPlanUnits_)));
+                .arg(skippedCacheUnits_ + qMax<qint64>(0, currentPlanUnits_ - processedPlanUnits_)));
             if (stopOnError_ && errorExitAction_ == ErrorExitAction::Commit) commit();
             if (stopOnError_ && errorExitAction_ == ErrorExitAction::Rollback) rollback();
             appendCurrentFileSummary();
@@ -2634,7 +2640,7 @@ void CommandDocumentWidget::processNext() {
         if (waitingServerOutput_ || waitingInclude_) return;
         ++succeededUnits_;
         ++currentFileSucceeded_;
-        if ((succeededUnits_ + failedUnits_) % 100 == 0) updateProgressDisplay();
+        if ((succeededUnits_ + failedUnits_ + skippedCacheUnits_) % 100 == 0) updateProgressDisplay();
         if (++localUnitsThisTurn >= 100) {
             QTimer::singleShot(0, this, &CommandDocumentWidget::processNext);
             return;
@@ -2649,9 +2655,9 @@ void CommandDocumentWidget::processNext() {
     appendCurrentFileSummary();
     if (advanceUnifiedCompile()) return;
     const qint64 durationMs = QDateTime::currentMSecsSinceEpoch() - executionStartedMs_;
-    appendOutput(QStringLiteral("脚本执行完成：成功 %1，失败 %2，跳过 0；开始时间 %3；发布时长 %4。")
+    appendOutput(QStringLiteral("脚本执行完成：成功 %1，失败 %2，跳过 %5；开始时间 %3；发布时长 %4。")
         .arg(succeededUnits_).arg(failedUnits_)
-        .arg(executionStartedText_, formatPublishDuration(durationMs)));
+        .arg(executionStartedText_, formatPublishDuration(durationMs)).arg(skippedCacheUnits_));
     finishPublishTiming(failedUnits_ > 0
         ? QStringLiteral("发布完成（有失败）") : QStringLiteral("发布完成"), true);
     stopAutomaticLog();
@@ -2705,13 +2711,13 @@ void CommandDocumentWidget::executeSql(const CommandUnit& unit) {
         QTimer::singleShot(0, this, &CommandDocumentWidget::processNext);
         return;
     }
-    appendExecutionOutput(QStringLiteral("[%1:%2] 执行 SQL")
-        .arg(unit.source.file).arg(unit.source.line));
     currentSqlSource_ = unit.source;
     currentSqlText_ = sql;
     lastSqlBufferSource_ = unit.source;
     lastSqlBuffer_ = sql;
     const QString owner = currentSchema_.isEmpty() ? profile_.user : currentSchema_;
+    appendExecutionOutput(QStringLiteral("[%1:%2] 执行 SQL")
+        .arg(unit.source.file).arg(unit.source.line));
     const std::optional<CommandCompiledObject> compiledObject =
         CommandScript::compiledObject(sql, owner);
     packageSpecificationCheck_ = compiledObject.has_value()
@@ -3629,9 +3635,45 @@ void CommandDocumentWidget::handleError(const SessionError& error) {
 
 void CommandDocumentWidget::appendOutputView(const QString& text) {
     QScrollBar* scrollBar = output_->verticalScrollBar();
-    const int previousValue = output_->isVisible() && !logScrollRestorePending_
+    int previousValue = output_->isVisible() && !logScrollRestorePending_
         ? scrollBar->value() : savedLogScrollPosition_;
-    output_->appendPlainText(text);
+    constexpr qint64 maxBytes = 8 * 1024 * 1024;
+    const QString marker = QStringLiteral("[较早输出已截断]");
+    auto* document = output_->document();
+    const qint64 bytes = text.toUtf8().size() + (document->isEmpty() ? 0 : 1);
+    if (bytes > maxBytes) {
+        // This entry alone evicts the full display buffer. The caller still logs it to disk.
+        output_->setPlainText(marker);
+        outputBlocks_.clear();
+        outputBytes_ = 0;
+        outputTruncated_ = true;
+        previousValue = 0;
+    } else {
+        const int before = document->characterCount();
+        output_->appendPlainText(text);
+        outputBlocks_.enqueue({bytes, document->characterCount() - before});
+        outputBytes_ += bytes;
+        if (outputBytes_ > maxBytes) {
+            // Trim complete entries together so a full log does not require a head edit on every append.
+            constexpr qint64 trimReserve = 256 * 1024;
+            int end = outputTruncated_ ? marker.size() : 0;
+            do {
+                const auto removed = outputBlocks_.dequeue();
+                outputBytes_ -= removed.bytes;
+                end += removed.documentCharacters;
+            } while (outputBlocks_.size() > 1 && outputBytes_ > maxBytes - trimReserve);
+            QTextCursor trim(document);
+            trim.setPosition(outputTruncated_ ? marker.size() : 0);
+            trim.setPosition(end, QTextCursor::KeepAnchor);
+            const auto lastRemoved = trim.block();
+            const int removedLines = lastRemoved.firstLineNumber() + lastRemoved.lineCount() - 1;
+            if (outputTruncated_) trim.removeSelectedText();
+            else trim.insertText(marker);
+            outputTruncated_ = true;
+            previousValue = qMax(0, previousValue - removedLines);
+        }
+    }
+    if (!followLog_->isChecked()) savedLogScrollPosition_ = previousValue;
     if (followLog_->isChecked()) scrollOutputToEnd();
     else {
         scrollBar->setValue(qMin(previousValue, scrollBar->maximum()));
@@ -3653,29 +3695,9 @@ void CommandDocumentWidget::appendOutput(const QString& text) {
             .arg(QFileInfo(currentFile_).fileName(), text));
         return;
     }
-    const QString block = outputBlocks_.isEmpty() ? text : QLatin1Char('\n') + text;
-    outputBlocks_.enqueue(block);
-    outputBytes_ += block.toUtf8().size();
     appendOutputView(text);
     writeSpool(text + QLatin1Char('\n'));
     writeAutomaticLog(text);
-    constexpr qint64 maxBytes = 8 * 1024 * 1024;
-    bool removed = false;
-    while (outputBytes_ > maxBytes && !outputBlocks_.isEmpty()) {
-        outputBytes_ -= outputBlocks_.dequeue().toUtf8().size();
-        removed = true;
-    }
-    if (removed) {
-        outputTruncated_ = true;
-        QString value;
-        for (const QString& retained : std::as_const(outputBlocks_)) value += retained;
-        auto* scrollBar = output_->verticalScrollBar();
-        const int previousValue = output_->isVisible() && !logScrollRestorePending_
-            ? scrollBar->value() : savedLogScrollPosition_;
-        output_->setPlainText(QStringLiteral("[较早输出已截断]\n") + value);
-        if (followLog_->isChecked()) scrollOutputToEnd();
-        else scrollBar->setValue(qMin(previousValue, scrollBar->maximum()));
-    }
     updateOutputHeader();
 }
 
@@ -4084,7 +4106,7 @@ void CommandDocumentWidget::updateProgressDisplay() {
     if (parallelRunning_) {
         int active = 0;
         const qint64 queuedFiles = parallelFiles_.size() - parallelNextFile_;
-        qint64 completedUnits = succeededUnits_ + failedUnits_;
+        qint64 completedUnits = succeededUnits_ + failedUnits_ + skippedCacheUnits_;
         // Unloaded entry files each reserve one placeholder. Replace these with
         // the actual unit counts when a worker's plan becomes available.
         qint64 knownUnits = nestedParallelBatch_ ? currentPlanUnits_ : completedUnits + queuedFiles;
@@ -4096,7 +4118,7 @@ void CommandDocumentWidget::updateProgressDisplay() {
             if (!slot.assigned) continue;
             ++active;
             const auto* worker = slot.document;
-            const qint64 done = worker->succeededUnits_ + worker->failedUnits_;
+            const qint64 done = worker->succeededUnits_ + worker->failedUnits_ + worker->skippedCacheUnits_;
             anyLoadedUnits |= worker->currentPlanUnits_ > 0;
             completedUnits += done;
             if (!nestedParallelBatch_)
@@ -4149,7 +4171,7 @@ void CommandDocumentWidget::updateProgressDisplay() {
         showProgress = true;
         publishProgress_->setRange(0, 10000);
         publishProgress_->setValue(static_cast<int>(qBound<qint64>(qint64{0},
-            (succeededUnits_ + failedUnits_) * 10000 / currentPlanUnits_, qint64{9999})));
+            (succeededUnits_ + failedUnits_ + skippedCacheUnits_) * 10000 / currentPlanUnits_, qint64{9999})));
         if (pendingIncludeUnits_ > 0 || waitingInclude_)
             publishProgress_->setFormat(QStringLiteral("估算 %p% · 总量展开中"));
     } else if (!completedPublishStatus_.isEmpty() && completedProgressMaximum_ > 0) {
@@ -4172,7 +4194,7 @@ void CommandDocumentWidget::updateProgressDisplay() {
         if (file.isEmpty()) file = QStringLiteral("—");
         progressLabel_->setText(
             QStringLiteral("已执行 %1／已知 %2 · 待展开 %3 · %4:%5")
-                .arg(succeededUnits_ + failedUnits_).arg(currentPlanUnits_).arg(pendingIncludeUnits_)
+                .arg(succeededUnits_ + failedUnits_ + skippedCacheUnits_).arg(currentPlanUnits_).arg(pendingIncludeUnits_)
                 .arg(file).arg(qMax(1, currentProgressSource_.line))
                 + QStringLiteral(" · 成功 %1 · 失败 %2").arg(succeededUnits_).arg(failedUnits_));
         const QString detail = progressLabel_->text() + QLatin1Char('\n')
@@ -4200,7 +4222,7 @@ void CommandDocumentWidget::updateProgressDisplay() {
     QString file = QFileInfo(currentRunningFile_).fileName();
     if (file.isEmpty()) file = QStringLiteral("—");
     progressLabel_->setText(QStringLiteral("已执行 %1／已知 %2 · %3:%4")
-        .arg(succeededUnits_ + failedUnits_).arg(currentPlanUnits_)
+        .arg(succeededUnits_ + failedUnits_ + skippedCacheUnits_).arg(currentPlanUnits_)
         .arg(file).arg(qMax(1, currentProgressSource_.line)));
     finish();
 }
@@ -4333,7 +4355,7 @@ void CommandDocumentWidget::finishPublishTiming(const QString& status, bool comp
     completedDurationMs_ = qMax<qint64>(0,
         QDateTime::currentMSecsSinceEpoch() - executionStartedMs_);
     completedPublishStatus_ = status;
-    completedProgressValue_ = succeededUnits_ + failedUnits_;
+    completedProgressValue_ = succeededUnits_ + failedUnits_ + skippedCacheUnits_;
     // A cancelled/failed batch with unopened descendants has no final total.
     completedProgressMaximum_ = pendingIncludeUnits_ > 0 ? 0 : currentPlanUnits_;
     publishTimer_->stop();

@@ -47,7 +47,7 @@ public:
     [[nodiscard]] bool isAvailable() const;
 
     static QString defaultPath();
-    static QString sanitizeSql(const QString& sql, int maxLength = 2048);
+    static QString sanitizeSql(const QString& sql, int maxLength = 0);
 
 private:
     [[nodiscard]] bool ensureReady(QString* error = nullptr) const;

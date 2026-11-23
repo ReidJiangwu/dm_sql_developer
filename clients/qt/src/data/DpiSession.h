@@ -137,7 +137,8 @@ signals:
         QString error,
         bool isPlan,
         quint64 executionId = 0,
-        quint64 sessionEpoch = 0);
+        quint64 sessionEpoch = 0,
+        QString failureDetail = {});
 
 private:
     [[nodiscard]] bool initializeApplicationSession(SessionError* error);
@@ -183,7 +184,7 @@ private:
     void fetchBatch(qint64 elapsedMs = 0);
     void advanceResult(qint64 elapsedMs = 0);
     void emitExecutionFinished(bool success, int errorCode = 0, const QString& error = QString(),
-        bool isPlan = false);
+        bool isPlan = false, bool cancelled = false, const QString& failureDetail = {});
     void emitExecutionStart(const QString& operation, bool isPlan, quint64 executionId = 0);
     [[nodiscard]] bool refreshTransactionState();
     void updateTransactionStateAfterExecution(bool success);

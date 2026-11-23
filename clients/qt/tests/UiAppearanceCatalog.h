@@ -647,7 +647,6 @@ inline int runUiAppearanceCatalog(QApplication& application, const QString& dire
         audit("keywords", new KeywordReferenceDialog);
         audit("help", new HelpDocumentDialog);
         audit("version", new VersionNotesDialog);
-        audit("update", new UpdateDialog);
         audit("backups", new PackageBodyBackupsDialog(nullptr, settings.filePath("backups")));
         audit("history-cleanup", new HistoryCleanupDialog({}));
         audit("migration-progress", new LegacyMigrationProgressDialog(QStringLiteral("离线迁移进度预览")));

@@ -77,7 +77,7 @@ pub struct Document {
     pub connection_id: Option<String>,
     pub text: Rope,
     pub tree: Option<Tree>,
-    pub semantic: SemanticSnapshot,
+    semantic: std::sync::OnceLock<SemanticSnapshot>,
     parser: Parser,
 }
 
@@ -86,16 +86,12 @@ impl Document {
         let mut parser = parser()?;
         let rope = Rope::from_str(&text);
         let tree = parse_if_supported(&mut parser, &text, None);
-        let has_errors = tree
-            .as_ref()
-            .is_some_and(|tree| tree.root_node().has_error());
-        let semantic = SemanticSnapshot::build(&text, has_errors);
         Ok(Self {
             version,
             connection_id,
             text: rope,
             tree,
-            semantic,
+            semantic: Default::default(),
             parser,
         })
     }
@@ -108,23 +104,49 @@ impl Document {
         if version <= self.version {
             return Ok(());
         }
+        if changes.is_empty() {
+            self.version = version;
+            return Ok(());
+        }
+        // Ranges in a batch are relative to the preceding edit. Restore the
+        // original revision if a later range is invalid.
+        let original = (changes.len() > 1).then(|| (self.text.clone(), self.tree.clone()));
         for change in changes {
             match change.range {
-                Some(range) => self.apply_incremental_change(range, &change.text)?,
+                Some(range) => {
+                    if let Err(error) = self.apply_incremental_change(range, &change.text) {
+                        if let Some((text, tree)) = original {
+                            self.text = text;
+                            self.tree = tree;
+                        }
+                        return Err(error);
+                    }
+                }
                 None => {
                     self.text = Rope::from_str(&change.text);
-                    self.tree = parse_if_supported(&mut self.parser, &change.text, None);
+                    self.tree = None;
                 }
             }
         }
         self.version = version;
-        let text = self.text.to_string();
-        let has_errors = self
-            .tree
-            .as_ref()
-            .is_some_and(|tree| tree.root_node().has_error());
-        self.semantic = SemanticSnapshot::build(&text, has_errors);
+        let text = &self.text;
+        self.tree = if text.len_bytes() <= MAX_DOCUMENT_BYTES {
+            self.parser.parse_with_options(&mut |byte, _| {
+                if byte >= text.len_bytes() {
+                    return &[][..];
+                }
+                let (chunk, start, _, _) = text.chunk_at_byte(byte);
+                &chunk.as_bytes()[byte - start..]
+            }, self.tree.as_ref(), None)
+        } else {
+            None
+        };
+        self.semantic.take();
         Ok(())
+    }
+
+    pub fn semantic(&self) -> &SemanticSnapshot {
+        self.semantic.get_or_init(|| SemanticSnapshot::build(&self.source(), self.has_syntax_errors()))
     }
 
     pub fn byte_offset(&self, position: Position) -> usize {
@@ -162,7 +184,6 @@ impl Document {
         collect_error_ranges(tree.root_node(), &mut byte_ranges);
         byte_ranges
             .into_iter()
-            .take(100)
             .map(|(start, end)| Range {
                 start: self.position_at_byte(start),
                 end: self.position_at_byte(end.max(start)),
@@ -204,8 +225,6 @@ impl Document {
                 new_end_position,
             });
         }
-        let text = self.text.to_string();
-        self.tree = parse_if_supported(&mut self.parser, &text, self.tree.as_ref());
         Ok(())
     }
 }
@@ -225,14 +244,21 @@ impl DocumentStore {
         Ok(())
     }
 
-    pub fn change(&mut self, params: DidChangeParams) -> Result<(), String> {
+    /// Returns whether a new text revision needs diagnostics.
+    pub fn change(&mut self, params: DidChangeParams) -> Result<bool, String> {
         let Some(document) = self.documents.get_mut(&params.text_document.uri) else {
             return Err("document is not open".to_owned());
         };
+        let version = params.text_document.version;
+        if version <= document.version {
+            return Ok(false);
+        }
+        let text_changed = !params.content_changes.is_empty();
+        document.apply_changes(version, params.content_changes)?;
         if params.connection_id.is_some() {
             document.connection_id = params.connection_id;
         }
-        document.apply_changes(params.text_document.version, params.content_changes)
+        Ok(text_changed)
     }
 
     pub fn close(&mut self, params: DidCloseParams) {
@@ -304,6 +330,10 @@ fn point_after_insert(start: Point, inserted: &str) -> Point {
 }
 
 fn collect_error_ranges(node: tree_sitter::Node<'_>, ranges: &mut Vec<(usize, usize)>) {
+    const LIMIT: usize = 100;
+    if !node.has_error() && !node.is_missing() {
+        return;
+    }
     if node.is_error() || node.is_missing() {
         ranges.push((node.start_byte(), node.end_byte()));
         return;
@@ -314,6 +344,9 @@ fn collect_error_ranges(node: tree_sitter::Node<'_>, ranges: &mut Vec<(usize, us
         };
         if let Some(child) = node.child(index) {
             collect_error_ranges(child, ranges);
+            if ranges.len() >= LIMIT {
+                break;
+            }
         }
     }
 }
@@ -321,6 +354,29 @@ fn collect_error_ranges(node: tree_sitter::Node<'_>, ranges: &mut Vec<(usize, us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_change_preserves_text_caches_and_rejects_late_replies() {
+        let mut store = DocumentStore::default();
+        store.open(DidOpenParams {
+            text_document: TextDocumentItem { uri: "doc".into(), version: 1, text: "SELECT 1;".into() },
+            connection_id: Some("first".into()),
+        }).unwrap();
+        let doc = store.get("doc").unwrap();
+        let node = doc.tree.as_ref().unwrap().root_node().id();
+        doc.semantic();
+        let switch = |version, id: &str| DidChangeParams {
+            text_document: VersionedTextDocumentIdentifier { uri: "doc".into(), version },
+            content_changes: vec![], connection_id: Some(id.into()),
+        };
+        assert!(!store.change(switch(3, "second")).unwrap());
+        assert!(!store.change(switch(2, "stale")).unwrap());
+        let doc = store.get("doc").unwrap();
+        assert_eq!(doc.version, 3);
+        assert_eq!(doc.connection_id.as_deref(), Some("second"));
+        assert!(doc.semantic.get().is_some());
+        assert_eq!(doc.tree.as_ref().unwrap().root_node().id(), node);
+    }
 
     #[test]
     fn utf16_positions_handle_surrogate_pairs() {
@@ -373,6 +429,49 @@ mod tests {
     }
 
     #[test]
+    fn incremental_parse_across_rope_chunks_matches_a_fresh_parse() {
+        let sql = format!("/* {} */\nSELECT old_name FROM t;", "跨块🙂".repeat(2000));
+        let mut doc = Document::open(1, sql.clone(), None).unwrap();
+        let range = Range {
+            start: Position { line: 1, character: 7 },
+            end: Position { line: 1, character: 15 },
+        };
+        let replacement = "\"新🙂列\", second_col";
+        doc.apply_changes(2, vec![ContentChange {
+            range: Some(range), text: replacement.into(),
+        }]).unwrap();
+        let expected = sql.replace("old_name", replacement);
+        let fresh = Document::open(1, expected.clone(), None).unwrap();
+        let root = doc.tree.as_ref().unwrap().root_node();
+        assert_eq!(root.end_byte(), expected.len());
+        assert_eq!(root.to_sexp(), fresh.tree.as_ref().unwrap().root_node().to_sexp());
+    }
+
+    #[test]
+    fn semantic_snapshot_follows_the_committed_version() {
+        let mut doc = Document::open(1, "SELECT a.x FROM t a".into(), None).unwrap();
+        assert!(doc.semantic.get().is_none());
+        let _ = doc.semantic();
+        assert!(doc.semantic.get().is_some());
+        doc.apply_changes(2, vec![ContentChange {
+            range: None, text: "SELECT b.x FROM t b".into(),
+        }]).unwrap();
+        assert!(doc.semantic.get().is_none());
+        assert!(doc.semantic().resolve_alias("a", 8).is_none());
+        let failed = doc.apply_changes(3, vec![
+            ContentChange { range: None, text: "SELECT 1".into() },
+            ContentChange { range: Some(Range {
+                start: Position { line: 9, character: 0 },
+                end: Position { line: 9, character: 1 },
+            }), text: String::new() },
+        ]);
+        assert!(failed.is_err());
+        assert_eq!(doc.version, 2);
+        assert_eq!(doc.source(), "SELECT b.x FROM t b");
+        assert!(doc.semantic.get().is_some());
+    }
+
+    #[test]
     fn accepts_keyword_prefixed_variables_in_anonymous_block() {
         let source = "DECLARE return_array_ Manual_Supplier_Invoice_Handling_SVC.\
 Posting_Structure_Art; cursor_ SYS_REFCURSOR; BEGIN return_array_ := \
@@ -384,5 +483,29 @@ OPEN cursor_ FOR SELECT * FROM TABLE(return_array_); NULL := cursor_; END;";
 
         assert!(!document.has_syntax_errors());
         assert!(document.syntax_error_ranges().is_empty());
+    }
+
+    #[test]
+    fn unicode_source_open_change_and_symbols_do_not_panic() {
+        let source = "CREATE OR REPLACE PACKAGE p AS \u{a0}field_ NUMBER; END p;";
+        let mut document = Document::open(1, source.into(), None).unwrap();
+        let symbols = crate::symbols::document_symbols(&document);
+        assert!(serde_json::to_string(&symbols).unwrap().contains("field_"));
+        document.apply_changes(2, vec![ContentChange {
+            range: None,
+            text: "CREATE OR REPLACE PACKAGE p AS 中文 NUMBER; END p;".into(),
+        }]).unwrap();
+        let _ = document.syntax_error_ranges();
+        let _ = crate::symbols::document_symbols(&document);
+        document.apply_changes(3, vec![ContentChange {
+            range: Some(Range {
+                start: Position { line: 0, character: 31 },
+                end: Position { line: 0, character: 33 },
+            }),
+            text: "restored_".into(),
+        }]).unwrap();
+        assert!(document.source().contains("restored_ NUMBER"));
+        assert!(serde_json::to_string(&crate::symbols::document_symbols(&document))
+            .unwrap().contains("restored_"));
     }
 }

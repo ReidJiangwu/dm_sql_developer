@@ -17,7 +17,7 @@ bool unchangedOption(const CommandUnit& unit, bool define) {
 }
 
 bool independentLeaf(const QVector<CommandUnit>& units,
-        const QMap<QString, QString>& variables, bool define, bool* serverOutput) {
+        const QMap<QString, QString>& variables, bool define, bool* serverOutput, QString* barrier) {
     if (units.isEmpty()) return false;
     for (const auto& unit : units) {
         if (unchangedOption(unit, define)) continue;
@@ -32,6 +32,17 @@ bool independentLeaf(const QVector<CommandUnit>& units,
             unit.type == CommandUnitType::Sql ? unit.text : unit.argument,
             variables, define, &unresolved);
         if (!unresolved.isEmpty()) return false;
+        if (unit.type == CommandUnitType::Sql
+                && unit.source.file.endsWith(QStringLiteral(".svc"), Qt::CaseInsensitive)) {
+            // Generated projection registrations update shared FND metadata across files.
+            static const QRegularExpression registration(QStringLiteral(
+                R"(\bFND_(?:PROJECTION|PROJ_ENTITY)_API\s*\.\s*CREATE_OR_REPLACE\s*\()"),
+                QRegularExpression::CaseInsensitiveOption);
+            if (registration.match(value).hasMatch()) {
+                *barrier = QStringLiteral("投影元数据登记需按文件顺序执行");
+                return false;
+            }
+        }
         if (unit.type == CommandUnitType::Sql && CommandParallelPlan::requiresSameSession(value)) {
             // The whole leaf stays on one worker, so its transaction controls
             // keep their statement order and connection.
@@ -102,8 +113,8 @@ CommandParallelBatch CommandParallelPlan::collect(
         auto loaded = CommandScript::loadFileShallow(
             reference.argument, workingDirectory, unit.source.includeChain);
         bool finalServerOutput = serverOutput;
-        if (!loaded.errors.isEmpty() || !independentLeaf(loaded.units, context, define, &finalServerOutput)) {
-            batch.barrier = QStringLiteral("嵌套容器、上下文修改或未确认变量需按顺序执行");
+        if (!loaded.errors.isEmpty() || !independentLeaf(loaded.units, context, define, &finalServerOutput, &batch.barrier)) {
+            if (batch.barrier.isEmpty()) batch.barrier = QStringLiteral("嵌套容器、上下文修改或未确认变量需按顺序执行");
             break;
         }
         paths.insert(key);

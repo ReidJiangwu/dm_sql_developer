@@ -111,7 +111,7 @@ struct ConnectionProfile {
     QString driver = QStringLiteral("DM8");
     QString sqlTextEncoding = QStringLiteral("UTF-8");
     int timeoutSeconds = 15;
-    int executionTimeoutSeconds = 300;
+    int executionTimeoutSeconds = 0;
     int fetchTimeoutSeconds = 60;
     int cancelTimeoutSeconds = 5;
     bool readOnly = false;

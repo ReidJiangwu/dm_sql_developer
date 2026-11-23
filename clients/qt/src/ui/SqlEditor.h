@@ -111,6 +111,8 @@ private:
     void updateSelectionStyle();
     void highlightCurrentLine();
     void updateExtraSelections();
+    mutable int bracketRevision_ = -1;
+    mutable QHash<int, int> bracketPartners_;
     [[nodiscard]] QList<QTextEdit::ExtraSelection> bracketSelections() const;
     void paintLineNumberArea(QPaintEvent* event);
     void handleLineNumberClick(int y);

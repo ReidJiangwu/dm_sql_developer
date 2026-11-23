@@ -6,6 +6,7 @@
 #include <QSet>
 #include <QPointer>
 #include <QWidget>
+#include <QVariantMap>
 
 class QComboBox;
 class QLabel;
@@ -23,6 +24,7 @@ class ProgramDocumentWidget final : public QWidget {
 
 public:
     explicit ProgramDocumentWidget(ObjectKey key, QWidget* parent = nullptr);
+    ~ProgramDocumentWidget() override;
 
     [[nodiscard]] const ObjectKey& primaryKey() const;
     [[nodiscard]] bool accepts(const ObjectKey& key) const;
@@ -66,8 +68,12 @@ protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
 
 private:
+    void flushCursorState();
+    QTimer* cursorSaveTimer_ = nullptr;
+    QVariantMap pendingCursorState_;
     void clearErrorTextSelection();
     SqlEditor* editorFor(const ObjectKey& key) const;
+    QHash<const SqlEditor*, QPair<int, bool>> nonBlankSource_;
     void updateState();
     void setActivityState(const QString& state);
     void requestCompileAll();
@@ -91,6 +97,11 @@ private:
     void navigateToError(int row);
     void requestPendingSymbols();
     void rebuildMembers();
+    void refreshMemberRows(bool specChanged, bool bodyChanged);
+    void queueMemberUpdate(SqlEditor* editor);
+    QSet<SqlEditor*> dirtyMemberEditors_;
+    QHash<SqlEditor*, quint64> savedDraftVersions_;
+    QHash<SqlEditor*, QString> draftBaselines_;
 
     ObjectKey key_;
     QTabWidget* sourceTabs_ = nullptr;
